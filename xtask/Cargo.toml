@@ -1,0 +1,15 @@
+[package]
+name = "xtask"
+description = "Сборочные задачи OBSOS: `cargo xtask vendor` — копии крейтов Servo с правками OBSOS в vendor/"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Отдельный workspace: корневой ссылается на vendor/ ([patch.crates-io]), а
+# vendor/ готовит как раз эта программа.
+[workspace]
+
+[dependencies]
+sha2 = "0.10"
+flate2 = "1"
+tar = "0.4"

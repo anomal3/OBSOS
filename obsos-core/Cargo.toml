@@ -1,0 +1,39 @@
+[package]
+name = "obsos-core"
+description = "OBSOS: оболочка браузера на Servo без привязки к ОС (вкладки, история, закладки, пароли, синхронизация, загрузки, скрипт страниц)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+servo.workspace = true
+euclid.workspace = true
+ipc-channel.workspace = true
+swgl.workspace = true
+gleam.workspace = true
+glow.workspace = true
+dpi.workspace = true
+url.workspace = true
+surfman.workspace = true
+egui.workspace = true
+egui_software_backend.workspace = true
+browser-sync.workspace = true
+rustls.workspace = true
+webpki-roots.workspace = true
+http.workspace = true
+chacha20poly1305.workspace = true
+argon2.workspace = true
+sha2.workspace = true
+sha1.workspace = true
+log.workspace = true
+getrandom.workspace = true
+
+[target.'cfg(target_os = "freeos")'.dependencies]
+# У servo-fonts freetype-sys закрыт cfg по ОС, а webrender тянет его и так:
+# FreeType и libpng — из исходников крейта.
+freetype-sys = { version = "0.23", features = ["bundled"] }
+
+[lints.rust]
+# FossAi — своя цель `<арх>-unknown-freeos` (target_os = "freeos").
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("freeos"))'] }

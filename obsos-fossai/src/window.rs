@@ -1,20 +1,13 @@
-//! Окно стола FreeOS (`freeos_window_*` из libfreeos), кадр страницы и
-//! сборка кадра окна; запуск других программ (`SYS_SPAWN`).
+//! Платформа FossAi для OBSOS: окно стола (`freeos_window_*` из libfreeos),
+//! буфер обмена, пояс, запуск программ (`SYS_SPAWN`), окно выбора файла
+//! (`/bin/filedlg`) — договор `obsos_core::window`.
 
 use std::cell::Cell;
 use std::ffi::{CString, c_void};
 use std::os::raw::{c_char, c_int};
+use std::path::Path;
 
-use egui_software_backend::{BufferMutRef, EguiSoftwareRender};
-
-#[repr(C)]
-#[derive(Default, Clone, Copy)]
-pub struct WinEvent {
-    pub kind: u32,
-    pub code: u32,
-    pub x: i32,
-    pub y: i32,
-}
+use obsos_core::window::{CursorShape, DialogAnswer, HostWindow, PendingDialog, Platform, WinEvent};
 
 extern "C" {
     fn freeos_window_open(title: *const c_char, width: u32, height: u32, surface: *mut *mut c_void) -> i64;
@@ -27,28 +20,18 @@ extern "C" {
     fn freeos_screen(width: *mut u32, height: *mut u32, pixel_format: *mut u32) -> c_int;
 }
 
-pub const WIN_KEY: u32 = 1;
-pub const WIN_POINTER: u32 = 2;
-pub const WIN_CLOSE: u32 = 3;
-pub const WIN_MOVE: u32 = 4;
-pub const WIN_LEAVE: u32 = 5;
-pub const WIN_RELEASE: u32 = 6;
-pub const WIN_RESIZE: u32 = 7;
-pub const WIN_KEYUP: u32 = 9;
-pub const WIN_WHEEL: u32 = 10;
 const WIN_STYLE_RESIZABLE: u32 = 1;
-pub const WIN_KEY_NAMED: u32 = 0x0100_0000;
 const PIXEL_RGB: u32 = 1;
 
 /// Окно: поверхность (u32 на точку, строки сверху вниз) и её размер.
 pub struct Window {
     id: i64,
     surface: Cell<*mut u32>,
-    pub width: Cell<u32>,
-    pub height: Cell<u32>,
+    width: Cell<u32>,
+    height: Cell<u32>,
     /// Красный в младшем байте (FREEOS_PIXEL_RGB): байты точки R,G,B,A;
     /// иначе B,G,R,A.
-    pub swap_rb: bool,
+    swap_rb: bool,
     cursor: Cell<CursorShape>,
 }
 
@@ -80,13 +63,36 @@ impl Window {
         })
     }
 
-    pub fn next_event(&self) -> Option<WinEvent> {
+    /// Поверхность целиком (строки подряд, без зазоров).
+    #[allow(clippy::mut_from_ref)]
+    fn pixels(&self) -> &mut [u32] {
+        let len = self.width.get() as usize * self.height.get() as usize;
+        // SAFETY: поверхность окна — width*height точек, отображена в нашу
+        // память и живёт до следующего `resize`; ссылка дальше кадра не живёт.
+        unsafe { std::slice::from_raw_parts_mut(self.surface.get(), len) }
+    }
+}
+
+impl HostWindow for Window {
+    fn width(&self) -> u32 {
+        self.width.get()
+    }
+
+    fn height(&self) -> u32 {
+        self.height.get()
+    }
+
+    fn swap_rb(&self) -> bool {
+        self.swap_rb
+    }
+
+    fn next_event(&self) -> Option<WinEvent> {
         let mut ev = WinEvent::default();
         // SAFETY: окно наше, структура — по договору user-abi `WinEvent`.
         (unsafe { freeos_window_event(self.id, &mut ev) } == 1).then_some(ev)
     }
 
-    pub fn resize(&self, width: u32, height: u32) -> bool {
+    fn resize(&self, width: u32, height: u32) -> bool {
         // SAFETY: окно наше; прежняя поверхность после вызова недействительна.
         let surface = unsafe { freeos_window_resize(self.id, width, height) };
         if surface.is_null() {
@@ -99,11 +105,11 @@ impl Window {
     }
 
     /// Номер окна у ядра (владелец модального окна выбора файла).
-    pub fn id(&self) -> i64 {
+    fn id(&self) -> i64 {
         self.id
     }
 
-    pub fn set_cursor(&self, shape: CursorShape) {
+    fn set_cursor(&self, shape: CursorShape) {
         if self.cursor.get() != shape {
             self.cursor.set(shape);
             // SAFETY: окно наше, вызов без адресов.
@@ -111,7 +117,7 @@ impl Window {
         }
     }
 
-    pub fn set_title(&self, title: &str) {
+    fn set_title(&self, title: &str) {
         // Не длиннее 64 байт UTF-8 (MAX_TITLE), по границе символа.
         let mut cut = title.len().min(60);
         while !title.is_char_boundary(cut) {
@@ -123,76 +129,15 @@ impl Window {
         }
     }
 
-    /// Поверхность целиком (строки подряд, без зазоров).
-    #[allow(clippy::mut_from_ref)]
-    fn pixels(&self) -> &mut [u32] {
-        let len = self.width.get() as usize * self.height.get() as usize;
-        // SAFETY: поверхность окна — width*height точек, отображена в нашу
-        // память и живёт до следующего `resize`; ссылка дальше кадра не живёт.
-        unsafe { std::slice::from_raw_parts_mut(self.surface.get(), len) }
-    }
-
-    pub fn close(&self) {
+    fn close(&self) {
         // SAFETY: окно наше.
         unsafe { freeos_window_close(self.id) };
     }
 
-    /// Собрать кадр окна: копия кадра страницы в её прямоугольнике, холст
-    /// egui поверх (панели непрозрачны, над страницей холст прозрачен).
-    pub fn compose(&self, page: &PageFrame, at: (usize, usize), renderer: &mut EguiSoftwareRender) {
-        let (ww, wh) = (self.width.get() as usize, self.height.get() as usize);
-        let (px, py) = (at.0.min(ww), at.1.min(wh));
-        let surface = self.pixels();
-        let (w, h) = ((ww - px).min(page.width), (wh - py).min(page.height));
-        let blank = if self.swap_rb { 0xffff_ffff } else { 0xffff_ffff };
-        for y in py..wh {
-            let row = &mut surface[y * ww..][..ww];
-            if y - py < h {
-                row[px..px + w].copy_from_slice(&page.pixels[(y - py) * page.width..][..w]);
-                row[px + w..].fill(blank);
-            } else {
-                row[px..].fill(blank);
-            }
-        }
-        // SAFETY: [u8; 4] и u32 одного размера; выравнивание u8 не строже.
-        let bytes = unsafe { std::slice::from_raw_parts_mut(surface.as_mut_ptr() as *mut [u8; 4], surface.len()) };
-        let mut buffer = BufferMutRef::new(bytes, ww, wh);
-        renderer.blit_canvas_to_buffer(&mut buffer);
+    fn present(&self, draw: &mut dyn FnMut(&mut [u32])) {
+        draw(self.pixels());
         // SAFETY: окно наше; нулевой размер — всё окно.
         unsafe { freeos_window_commit(self.id, 0, 0, 0, 0) };
-    }
-}
-
-/// Последний кадр страницы — уже в формате точек окна, строки сверху вниз.
-#[derive(Default)]
-pub struct PageFrame {
-    pub pixels: Vec<u32>,
-    pub width: usize,
-    pub height: usize,
-    pub fresh: bool,
-    pub count: u64,
-}
-
-impl PageFrame {
-    /// Кадр swgl (BGRA, строки снизу вверх).
-    pub fn store(&mut self, frame: &[u8], fw: u32, fh: u32, swap_rb: bool) {
-        let (w, h) = (fw as usize, fh as usize);
-        self.pixels.resize(w * h, 0xffff_ffff);
-        self.width = w;
-        self.height = h;
-        for y in 0..h {
-            let src = &frame[(h - 1 - y) * w * 4..][..w * 4];
-            let dst = &mut self.pixels[y * w..][..w];
-            for (px, s) in dst.iter_mut().zip(src.chunks_exact(4)) {
-                let (b, g, r) = (s[0] as u32, s[1] as u32, s[2] as u32);
-                *px = if swap_rb { 0xff00_0000 | (b << 16) | (g << 8) | r } else { 0xff00_0000 | (r << 16) | (g << 8) | b };
-            }
-        }
-        self.fresh = true;
-        self.count += 1;
-        if self.count <= 3 || self.count % 100 == 0 {
-            println!("browser: frame {} presented {w}x{h}", self.count);
-        }
     }
 }
 
@@ -267,18 +212,6 @@ pub fn timezone_minutes() -> Option<i32> {
     (r != ERR_NOSYS && r.abs() <= 18 * 60).then_some(r as i32)
 }
 
-/// Форма указателя над окном (`WIN_CURSOR_*`).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum CursorShape {
-    Arrow = 0,
-    Text = 1,
-    Hand = 2,
-    Move = 3,
-    NotAllowed = 4,
-    ResizeEw = 5,
-    ResizeNs = 6,
-}
-
 const SYS_WRITE: usize = 1;
 const SYS_READ: usize = 6;
 const SYS_CLOSE: usize = 7;
@@ -312,20 +245,14 @@ fn close_fd(fd: isize) {
 /// стандартный ввод, ответ — строка `\x1efiledlg-answer\tok\tПУТЬ` в выводе
 /// (договор `user_progs::filedlg`). Каналы ядра неблокирующие — `poll` не
 /// ждёт.
-pub struct FileDialog {
+struct FileDialog {
     out: isize,
     pending: Vec<u8>,
 }
 
-/// Чем кончилось окно выбора файла.
-pub enum DialogAnswer {
-    Chosen(String),
-    Cancelled,
-}
-
 impl FileDialog {
     /// «Сохранить как»: папка, предложенное имя, окно-владелец.
-    pub fn save(owner: i64, title: &str, dir: &str, name: &str) -> Result<FileDialog, String> {
+    fn save(owner: i64, title: &str, dir: &str, name: &str) -> Result<FileDialog, String> {
         let clean = |t: &str| t.replace(['\n', '\r', '\t'], " ");
         let request = format!(
             "mode\tsave\nowner\t{owner}\ntag\tobsos\ntitle\t{}\ndir\t{}\nname\t{}\nindex\t0\nextension\t0\n",
@@ -337,7 +264,7 @@ impl FileDialog {
     }
 
     /// «Выбор папки» (папка загрузок в настройках).
-    pub fn folder(owner: i64, title: &str, dir: &str) -> Result<FileDialog, String> {
+    fn folder(owner: i64, title: &str, dir: &str) -> Result<FileDialog, String> {
         let clean = |t: &str| t.replace(['\n', '\r', '\t'], " ");
         Self::start(&format!("mode\tfolder\nowner\t{owner}\ntag\tobsos\ntitle\t{}\ndir\t{}\n", clean(title), clean(dir)))
     }
@@ -387,8 +314,11 @@ impl FileDialog {
         Ok(FileDialog { out: out_read, pending: Vec::new() })
     }
 
+}
+
+impl PendingDialog for FileDialog {
     /// Ответ, не дожидаясь: `None` — окно ещё открыто.
-    pub fn poll(&mut self) -> Option<DialogAnswer> {
+    fn poll(&mut self) -> Option<DialogAnswer> {
         let mut buf = [0u8; 1024];
         let ended = loop {
             // SAFETY: буфер наш.
@@ -431,4 +361,62 @@ pub fn chromium_installed() -> bool {
 pub fn open_in_chromium(url: &str) -> Result<i64, i64> {
     let safe: String = url.chars().filter(|c| !c.is_whitespace()).collect();
     spawn(&format!("/opt/debian/bin/bash {CHROMIUM} {safe}"))
+}
+
+/// Службы FossAi для оболочки.
+pub struct FossAi;
+
+/// Где пакет `obsos` ставит программу (`/opt/obsos`).
+const OBSOS: &str = "/opt/obsos/bin/obsos";
+
+impl Platform for FossAi {
+    fn clipboard_set(&self, text: &str) {
+        clipboard_set(text)
+    }
+
+    fn clipboard_get(&self) -> Option<String> {
+        clipboard_get()
+    }
+
+    fn timezone_minutes(&self) -> Option<i32> {
+        timezone_minutes()
+    }
+
+    fn new_window(&self, args: &[&str]) -> Result<(), String> {
+        let mut command = String::from(OBSOS);
+        for a in args {
+            command.push(' ');
+            command.push_str(a);
+        }
+        spawn(&command).map(|_| ()).map_err(|e| format!("SYS_SPAWN {e}"))
+    }
+
+    fn show_in_folder(&self, path: &Path) -> Result<(), String> {
+        spawn(&format!("/bin/files {}", path.display())).map(|_| ()).map_err(|e| format!("SYS_SPAWN {e}"))
+    }
+
+    fn install_package(&self, path: &Path) -> Option<Result<(), String>> {
+        let shown = path.display().to_string();
+        shown.to_ascii_lowercase().ends_with(".fpk").then(|| spawn(&format!("/bin/pkg install {shown}")).map(|_| ()).map_err(|e| format!("SYS_SPAWN {e}")))
+    }
+
+    fn chromium_installed(&self) -> bool {
+        chromium_installed()
+    }
+
+    fn open_in_chromium(&self, url: &str) -> Result<i64, String> {
+        open_in_chromium(url).map_err(|e| format!("SYS_SPAWN {e}"))
+    }
+
+    fn save_dialog(&self, owner: &obsos_core::window::Window, title: &str, dir: &str, name: &str) -> Result<obsos_core::window::FileDialog, String> {
+        FileDialog::save(owner.id(), title, dir, name).map(|d| Box::new(d) as obsos_core::window::FileDialog)
+    }
+
+    fn folder_dialog(&self, owner: &obsos_core::window::Window, title: &str, dir: &str) -> Result<obsos_core::window::FileDialog, String> {
+        FileDialog::folder(owner.id(), title, dir).map(|d| Box::new(d) as obsos_core::window::FileDialog)
+    }
+
+    fn notice_path(&self) -> String {
+        String::from("/opt/obsos/share/NOTICE.md")
+    }
 }

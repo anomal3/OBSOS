@@ -1,8 +1,8 @@
-//! OBSOS — Open Browser for System Open Source, браузер FreeOS на Servo.
+//! Главный цикл OBSOS: окно платформы (`crate::window`), Servo, оболочка.
 //!
-//! `obsos [--profile <имя>] [--sync-folder <папка>] [адрес]`
+//! `obsos [--profile <имя>] [--sync-folder <папка>] [--private] [адрес]`
 //!
-//! Окно стола FreeOS, страницу рисует swgl (программный OpenGL, `swgl_ctx`),
+//! Окно даёт платформа (стол FossAi, winit на Windows/Linux), страницу рисует swgl (программный OpenGL, `swgl_ctx`),
 //! оболочку — egui прямо в пиксели окна (`ui.rs`). Вкладки — `WebView`
 //! одного контекста swgl, видима только активная. Синхронизация (свой
 //! репозиторий GitHub/GitLab/Bitbucket с тегами-точками, Яндекс Диск, Google
@@ -12,22 +12,6 @@
 //! Клавиши — раскладка Chromium (Ctrl+T/W/L/D/H/F/G/R, Ctrl+Shift+T/O/Q,
 //! Ctrl+1..9, Ctrl+Tab, Alt+←/→/Home, F3/F5/F6/F10, Ctrl±/0) и своя
 //! Ctrl+Shift+S — синхронизировать.
-
-#[path = "../../swgl_ctx.rs"]
-mod swgl_ctx;
-
-mod blocker;
-mod devtools;
-mod downloads;
-mod net;
-mod pages;
-mod profile;
-mod shell;
-mod syncer;
-mod tools;
-mod ui;
-mod vault;
-mod window;
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -51,6 +35,7 @@ use crate::swgl_ctx::SwglRenderingContext;
 use crate::syncer::Syncer;
 use crate::vault::{OpenError, Vault};
 use crate::window::*;
+use crate::{blocker, devtools, downloads, shell, swgl_ctx, ui, window};
 
 #[derive(Clone)]
 struct Waker(Arc<AtomicBool>);
@@ -191,7 +176,7 @@ fn content_manager(servo: &servo::Servo, profile: &Profile) -> Rc<UserContentMan
                 scripts += 1;
             }
             Some("css") => {
-                if let Ok(url) = url::Url::parse(&format!("file://{}", path.display())) {
+                if let Ok(url) = url::Url::from_file_path(&path) {
                     manager.add_stylesheet(Rc::new(servo::user_contents::UserStyleSheet::new(source, url)));
                     styles += 1;
                 }
@@ -266,13 +251,16 @@ struct Touch {
     dragging: bool,
 }
 
-fn main() {
+/// Открыть окно (заголовок, ширина, высота) и работать до его закрытия.
+/// Ключи — из командной строки процесса. Службы платформы
+/// (`window::install`) должны быть поставлены заранее.
+pub fn run(open_window: impl FnOnce(&str, u32, u32) -> Option<Rc<Window>>) -> ! {
     let _ = log::set_logger(&LOGGER).map(|()| log::set_max_level(log::LevelFilter::Warn));
     // Дом должен быть записываемым (профиль, кеш и база Servo). На телефоне
     // корень — FAT32 только на чтение, а записываемый том в памяти ядро
     // монтирует в `/home`: туда, если в `HOME` писать нельзя.
     let writable = |dir: &std::path::Path| std::fs::create_dir_all(dir.join(".config")).is_ok();
-    if !std::env::var_os("HOME").map(std::path::PathBuf::from).is_some_and(|home| writable(&home)) && writable(std::path::Path::new("/home")) {
+    if cfg!(target_os = "freeos") && !std::env::var_os("HOME").map(std::path::PathBuf::from).is_some_and(|home| writable(&home)) && writable(std::path::Path::new("/home")) {
         println!("browser: home /home (HOME is not writable)");
         // SAFETY (edition 2021: безопасно): до запуска любых потоков.
         std::env::set_var("HOME", "/home");
@@ -299,10 +287,10 @@ fn main() {
             first_url = Some(arg);
         }
     }
-    let Some(window) = Window::open(if private { "OBSOS — Инкогнито" } else { "OBSOS — Браузер" }, 1024, 700) else {
+    let Some(window_rc) = open_window(if private { "OBSOS — Инкогнито" } else { "OBSOS — Браузер" }, 1024, 700) else {
         std::process::exit(1);
     };
-    let window = Rc::new(window);
+    let window: &Window = &*window_rc;
     // TMPDIR и прочие каталоги Servo — до запуска его потоков.
     let _ = swgl_ctx::prepare_dirs(None);
     // Часовой пояс для JavaScript (`Date`, `Intl`): SpiderMonkey берёт его из
@@ -329,9 +317,9 @@ fn main() {
     };
 
     let page = Rc::new(RefCell::new(PageFrame::default()));
-    let context = SwglRenderingContext::new(page_size(&profile.settings.look, window.width.get(), window.height.get()));
+    let context = SwglRenderingContext::new(page_size(&profile.settings.look, window.width(), window.height()));
     {
-        let (page, swap_rb) = (page.clone(), window.swap_rb);
+        let (page, swap_rb) = (page.clone(), window.swap_rb());
         context.set_present_hook(Box::new(move |frame, w, h| page.borrow_mut().store(frame, w, h, swap_rb)));
     }
     let _ = context.make_current();
@@ -360,7 +348,7 @@ fn main() {
         prefs.js_offthread_compilation_enabled = false;
         println!("browser: off-thread JS compilation off (--no-offthread)");
     }
-    if window.width.get() < 800 {
+    if window.width() < 800 {
         MOBILE.store(true, Ordering::Relaxed);
         prefs.user_agent = String::from("Mozilla/5.0 (Android 10; Mobile; rv:153.0) Servo/0.8.0 Firefox/153.0");
         prefs.viewport_meta_enabled = true;
@@ -435,23 +423,23 @@ fn main() {
     // домашняя страница.
     let session = shell.profile.settings.restore_session.then(|| shell.profile.load_session()).flatten();
     match (first_url.and_then(|a| shell.url_from_input(&a)), session) {
-        (Some(url), _) => shell.new_tab(url, &window),
+        (Some(url), _) => shell.new_tab(url, window),
         (None, Some((urls, active))) => {
             for u in &urls {
                 if let Ok(url) = url::Url::parse(u) {
-                    shell.new_tab(url, &window);
+                    shell.new_tab(url, window);
                 }
             }
             if shell.tabs.is_empty() {
                 let home = shell.home_url();
-                shell.new_tab(home, &window);
+                shell.new_tab(home, window);
             } else {
-                shell.activate(active.min(shell.tabs.len() - 1), &window);
+                shell.activate(active.min(shell.tabs.len() - 1), window);
             }
         }
         (None, None) => {
             let home = shell.home_url();
-            shell.new_tab(home, &window);
+            shell.new_tab(home, window);
         }
     }
     println!("browser: servo up in {:?}", t0.elapsed());
@@ -465,13 +453,13 @@ fn main() {
     let ctx = egui::Context::default();
     // Узкий экран (телефон, 720 точек): вкладки сверху — боковая панель
     // съела бы треть ширины. Только на этот запуск, в профиль не пишется.
-    if window.width.get() < 800 && shell.profile.settings.look.side_tabs {
+    if window.width() < 800 && shell.profile.settings.look.side_tabs {
         shell.profile.settings.look.side_tabs = false;
-        shell.resize_all(&window);
+        shell.resize_all(window);
     }
     let mut look = shell.look().clone();
     ui::style(&ctx, &look);
-    let mut renderer = EguiSoftwareRender::new(if window.swap_rb { ColorFieldOrder::Rgba } else { ColorFieldOrder::Bgra });
+    let mut renderer = EguiSoftwareRender::new(if window.swap_rb() { ColorFieldOrder::Rgba } else { ColorFieldOrder::Bgra });
     let mut events: Vec<egui::Event> = Vec::new();
     let mut actions: Vec<Action> = Vec::new();
     let mut mask = 0i32;
@@ -493,7 +481,7 @@ fn main() {
     'run: loop {
         let mut input = false;
         let (ox, oy) = page_origin(&look);
-        let page_right = window.width.get().saturating_sub(crate::shell::dev_dock()) as i32;
+        let page_right = window.width().saturating_sub(crate::shell::dev_dock()) as i32;
         let in_page = |x: i32, y: i32| x >= ox as i32 && y >= oy as i32 && x < page_right;
         let page_point = |x: i32, y: i32| DevicePoint::new((x - ox as i32) as f32, (y - oy as i32) as f32);
         while let Some(ev) = window.next_event() {
@@ -506,7 +494,7 @@ fn main() {
                     let (w, h) = (ev.x.max(1) as u32, ev.y.max(1) as u32);
                     println!("browser: resize asked {w}x{h}");
                     if window.resize(w, h) {
-                        shell.resize_all(&window);
+                        shell.resize_all(window);
                         println!("browser: resized {w}x{h}");
                     } else {
                         println!("browser: resize to {w}x{h} failed: {}", std::io::Error::last_os_error());
@@ -682,7 +670,7 @@ fn main() {
                     };
                     if let Some(action) = shortcut {
                         println!("browser: shortcut {action:?}");
-                        if !shell.run(action, &window) {
+                        if !shell.run(action, window) {
                             break 'run;
                         }
                         continue;
@@ -725,16 +713,16 @@ fn main() {
         }
 
         shell.servo.spin_event_loop();
-        let mut changed = shell.apply_notes(&window);
-        changed |= shell.poll_sync(&window);
-        changed |= shell.poll_downloads(&window);
+        let mut changed = shell.apply_notes(window);
+        changed |= shell.poll_sync(window);
+        changed |= shell.poll_downloads(window);
         if input || changed {
             ui_due = Some(Instant::now());
         }
 
         let mut ui_drawn = false;
         if ui_due.is_some_and(|due| Instant::now() >= due) {
-            let (ww, wh) = (window.width.get(), window.height.get());
+            let (ww, wh) = (window.width(), window.height());
             let raw = egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(ww as f32, wh as f32))),
                 time: Some(started.elapsed().as_secs_f64()),
@@ -761,7 +749,7 @@ fn main() {
             }
             ui_drawn = true;
             for action in std::mem::take(&mut actions) {
-                if !shell.run(action, &window) {
+                if !shell.run(action, window) {
                     break 'run;
                 }
                 ui_due = Some(Instant::now());
@@ -769,20 +757,20 @@ fn main() {
             // Инструменты разработчика открыли, закрыли или растянули — страница
             // уже или шире (встроены справа, как в Chromium).
             let want_dock = if shell.panel == Some(Panel::DevTools) {
-                (shell.dev.width as u32).min(window.width.get().saturating_sub(300))
+                (shell.dev.width as u32).min(window.width().saturating_sub(300))
             } else {
                 0
             };
             if want_dock != crate::shell::dev_dock() {
                 crate::shell::set_dev_dock(want_dock);
-                shell.resize_all(&window);
+                shell.resize_all(window);
                 ui_due = Some(Instant::now());
             }
             // Полоса загрузок внизу (как в Chrome): страница на её высоту ниже.
             let want_bar = if shell.dl.bar && !shell.delegate.downloads.snapshot().is_empty() { crate::shell::DOWNLOADS_BAR_H } else { 0 };
             if want_bar != crate::shell::downloads_bar() {
                 crate::shell::set_downloads_bar(want_bar);
-                shell.resize_all(&window);
+                shell.resize_all(window);
                 println!("browser: downloads bar {}", if want_bar > 0 { "shown" } else { "hidden" });
                 ui_due = Some(Instant::now());
             }
@@ -793,7 +781,7 @@ fn main() {
                 ui::style(&ctx, &look);
                 shell.update_page_data();
                 if relayout {
-                    shell.resize_all(&window);
+                    shell.resize_all(window);
                 }
                 ui_due = Some(Instant::now());
             }
@@ -812,7 +800,7 @@ fn main() {
         if shell.quit {
             break;
         }
-        std::thread::sleep(Duration::from_millis(5));
+        window.idle(Duration::from_millis(5));
     }
     println!("browser: closing");
     shell.profile.save_session(&shell.session_urls(), shell.active);
@@ -822,7 +810,7 @@ fn main() {
         shell.sync_now(None);
         let until = Instant::now() + Duration::from_secs(10);
         while shell.syncer.busy > 0 && Instant::now() < until {
-            let _ = shell.poll_sync(&window);
+            let _ = shell.poll_sync(window);
             std::thread::sleep(Duration::from_millis(50));
         }
     }

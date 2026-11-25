@@ -1,0 +1,20 @@
+[package]
+name = "obsos-desktop"
+description = "OBSOS для Windows и Linux: окно winit, кадр — программный (swgl + egui в пиксели, softbuffer)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "obsos"
+path = "src/main.rs"
+
+[dependencies]
+obsos-core = { path = "../obsos-core" }
+winit = "0.30"
+softbuffer = "0.4"
+arboard = { version = "3", default-features = false }
+# Окна выбора файла: на Windows — системные (COM), на Linux — портал xdg
+# (без GTK при сборке).
+rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }

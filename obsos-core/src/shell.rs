@@ -712,8 +712,12 @@ impl Shell {
         if text.is_empty() {
             return None;
         }
-        if text.starts_with('/') {
-            return Some(if pages::viewable_path(text) { pages::view_url(text) } else { url::Url::parse(&format!("file://{text}")).ok()? });
+        // Путь к файлу: `/…`, на Windows и `C:\…`.
+        if text.starts_with('/') || (cfg!(windows) && std::path::Path::new(text).is_absolute()) {
+            if pages::viewable_path(text) {
+                return Some(pages::view_url(text));
+            }
+            return url::Url::from_file_path(text).ok().or_else(|| url::Url::parse(&format!("file://{text}")).ok());
         }
         if text.contains("://") || text.starts_with("data:") || text.starts_with("about:") || text.starts_with("obsos:") {
             return url::Url::parse(text).ok();
@@ -744,7 +748,7 @@ impl Shell {
             accent: look.accent.hex(),
             accent2: look.accent2.hex(),
             chromium: window::chromium_installed(),
-            notice_path: String::from("/opt/obsos/share/NOTICE.md"),
+            notice_path: window::platform().notice_path(),
         };
         if let Ok(mut shared) = self.page_data.lock() {
             if *shared == data {
@@ -764,10 +768,10 @@ impl Shell {
 
     fn open_tab(&mut self, webview: WebView, window: &Window) {
         self.opened += 1;
-        if crate::MOBILE.load(std::sync::atomic::Ordering::Relaxed) {
+        if crate::app::MOBILE.load(std::sync::atomic::Ordering::Relaxed) {
             webview.set_hidpi_scale_factor(euclid::Scale::new(2.0));
         }
-        webview.resize(page_size(self.look(), window.width.get(), window.height.get()));
+        webview.resize(page_size(self.look(), window.width(), window.height()));
         self.tabs.push(Tab {
             webview,
             title: String::from("Новая вкладка"),
@@ -840,7 +844,7 @@ impl Shell {
     }
 
     pub fn resize_all(&self, window: &Window) {
-        let size = page_size(self.look(), window.width.get(), window.height.get());
+        let size = page_size(self.look(), window.width(), window.height());
         // Холст swgl Servo меняет сам (`resize_rendering_context`) и, если
         // холст уже нужного размера, пропускает перестройку WebRender, —
         // поэтому трогать его здесь нельзя.
@@ -1188,7 +1192,8 @@ impl Shell {
                     self.toast("Chromium не установлен — поставьте пакет chromium в «Пакетах»");
                 } else {
                     match window::open_in_chromium(&url) {
-                        Ok(task) => self.toast(format!("Открываю в Chromium (задача {task})")),
+                        Ok(task) if task > 0 => self.toast(format!("Открываю в Chromium (задача {task})")),
+                        Ok(_) => self.toast("Открываю во внешнем браузере"),
                         Err(e) => self.toast(format!("Chromium не запустился: {e}")),
                     }
                 }
@@ -1228,7 +1233,7 @@ impl Shell {
                 }
             }
             Action::PrivateWindow => {
-                let _ = window::spawn("/opt/obsos/bin/obsos --private");
+                window::new_window(&["--private"]);
             }
             Action::Reopen => {
                 if let Some(url) = self.closed.pop() {
@@ -1291,7 +1296,7 @@ impl Shell {
             return;
         }
         let dir = self.delegate.downloads.dir.borrow().display().to_string();
-        match window::FileDialog::folder(window.id(), "Папка для загрузок", &dir) {
+        match window::platform().folder_dialog(window, "Папка для загрузок", &dir) {
             Ok(d) => self.dl.dialog = Some((DialogFor::Folder, d)),
             Err(e) => self.toast(format!("Окно выбора папки не открылось: {e}")),
         }
@@ -1363,7 +1368,7 @@ impl Shell {
             let (id, name) = self.dl.queue.remove(0);
             let dir = downloads.dir.borrow().clone();
             let _ = std::fs::create_dir_all(&dir);
-            match window::FileDialog::save(window.id(), "Сохранить как", &dir.display().to_string(), &name) {
+            match window::platform().save_dialog(window, "Сохранить как", &dir.display().to_string(), &name) {
                 Ok(d) => self.dl.dialog = Some((DialogFor::Save(id), d)),
                 Err(e) => {
                     // Окна нет (старая система) — в папку загрузок.

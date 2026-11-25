@@ -1,0 +1,6 @@
+[toolchain]
+# Та же ночная сборка, что у FossAi (сборщик fossai-builder): правки std под
+# FossAi привязаны к её rust-src, а Cargo.lock общий.
+channel = "nightly-2026-08-11"
+profile = "minimal"
+components = ["rust-src"]

@@ -1,0 +1,76 @@
+[workspace]
+resolver = "2"
+members = [
+    "obsos-core",
+    "obsos-desktop",
+    "obsos-fossai",
+    "crates/browser-sync",
+]
+# obsos-fossai собирается только под `<арх>-unknown-freeos` (сборщик FossAi,
+# см. README); обычный `cargo build` на Windows/Linux — настольный OBSOS.
+default-members = ["obsos-desktop"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+# Как у FossAi, откуда код пришёл; сменить может только владелец.
+license = "GPL-3.0-only"
+
+[workspace.dependencies]
+# Servo — с crates.io, ровно та версия, что у FossAi (Cargo.lock общий).
+# Без default-features: без multiprocess (gaol, песочница), clipboard,
+# devtools; без media-gstreamer, webxr, webgpu, webgl, bluetooth.
+# baked-in-resources — файлы ресурсов Servo внутри программы; js_jit — JIT
+# SpiderMonkey (без него нет WebAssembly, а значит Blazor).
+servo = { version = "=0.8.0", default-features = false, features = ["baked-in-resources", "js_jit"] }
+euclid = "0.22"
+ipc-channel = { version = "0.23", features = ["force-inprocess"] }
+swgl = "0.70"
+gleam = "0.15"
+glow = "0.17"
+dpi = "0.1"
+url = "2.5"
+surfman = { version = "0.14", default-features = false }
+egui = { version = "0.34", default-features = false, features = ["default_fonts"] }
+egui_software_backend = { version = "0.0.3", default-features = false, features = ["std"] }
+browser-sync = { path = "crates/browser-sync", features = ["std"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "aws-lc-rs", "logging"] }
+webpki-roots = "1"
+http = "1"
+chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc"] }
+argon2 = { version = "0.6", default-features = false, features = ["alloc"] }
+sha2 = "0.10"
+sha1 = "0.10"
+log = "0.4"
+getrandom = "0.4"
+
+[patch.crates-io]
+# Холст egui не обновлялся, когда фигура исчезала (закрытая панель оставалась
+# поверх страницы) — копия с правкой, third_party/egui-software-backend/FREEOS.md.
+egui_software_backend = { path = "third_party/egui-software-backend" }
+# Правки OBSOS в крейтах Servo 0.8 (patches/README.md): копии крейтов с
+# crates.io в vendor/ (не в git) готовит `cargo xtask vendor`. Правки под
+# FossAi закрыты `cfg(target_os = "freeos")`, общие (потоковая компиляция
+# wasm) действуют везде.
+gaol = { path = "vendor/gaol-stub" }
+servo-script = { path = "vendor/servo-script-0.8.0" }
+servo-net = { path = "vendor/servo-net-0.8.0" }
+servo-paint = { path = "vendor/servo-paint-0.8.0" }
+servo-storage = { path = "vendor/servo-storage-0.8.0" }
+servo-fonts = { path = "vendor/servo-fonts-0.8.0" }
+servo-fonts-traits = { path = "vendor/servo-fonts-traits-0.8.0" }
+
+[profile.release]
+panic = "abort"
+debug = false
+codegen-units = 16
+strip = true
+
+# Отладка на Windows/Linux: свой код с отладочной информацией, Servo — без
+# (иначе цель разрастается на десятки гигабайт).
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+opt-level = 2
+debug = false

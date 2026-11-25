@@ -34,9 +34,7 @@ fn check(name: &str, ok: bool) {
 
 const W: u32 = 640;
 const H: u32 = 480;
-
-mod swgl_ctx;
-use swgl_ctx::SwglRenderingContext;
+use obsos_core::swgl_ctx::{self, SwglRenderingContext};
 
 // ── Servo ───────────────────────────────────────────────────────────────────
 

@@ -1339,9 +1339,12 @@ pub fn open_download(path: &std::path::Path, actions: &mut Vec<Action>) {
     if crate::pages::viewable_path(&shown) {
         actions.push(Action::NewTabUrl(crate::pages::view_url(&shown).to_string()));
     } else if [".html", ".htm", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp"].iter().any(|e| lower.ends_with(e)) {
-        actions.push(Action::NewTabUrl(format!("file://{shown}")));
-    } else if lower.ends_with(".fpk") {
-        let _ = crate::window::spawn(&format!("/bin/pkg install {shown}"));
+        let url = url::Url::from_file_path(path).map(|u| u.to_string()).unwrap_or_else(|()| format!("file://{shown}"));
+        actions.push(Action::NewTabUrl(url));
+    } else if let Some(result) = crate::window::platform().install_package(path) {
+        if let Err(e) = result {
+            println!("browser: install {shown} failed: {e}");
+        }
     } else {
         show_in_folder(path);
     }
@@ -1350,7 +1353,7 @@ pub fn open_download(path: &std::path::Path, actions: &mut Vec<Action>) {
 /// «Показать в папке»: «Файлы» открываются на папке с выделенным файлом.
 pub fn show_in_folder(path: &std::path::Path) {
     println!("browser: show in folder {}", path.display());
-    let _ = crate::window::spawn(&format!("/bin/files {}", path.display()));
+    crate::window::show_in_folder(path);
 }
 
 /// Строка состояния загрузки: «37% · 12,3 МБ из 1,0 ГБ · 5,1 МБ/с · ещё 2 мин».
@@ -1507,7 +1510,7 @@ fn downloads(ui: &mut Ui, shell: &mut Shell, actions: &mut Vec<Action>) {
     ui.horizontal(|ui| {
         if ui.button("Открыть папку").clicked() {
             let _ = std::fs::create_dir_all(&dir);
-            let _ = crate::window::spawn(&format!("/bin/files {}", dir.display()));
+            crate::window::show_in_folder(&dir);
         }
         if ui.button("Очистить список").clicked() {
             shell.delegate.downloads.clear_finished();
@@ -1592,13 +1595,13 @@ fn profiles(ui: &mut Ui, shell: &mut Shell) {
         ui.label(RichText::new("Это окно инкогнито: история, куки и вход забываются при закрытии.").strong());
     }
     if ui.button("Окно гостя (инкогнито, Ctrl+Shift+N)").clicked() {
-        let _ = crate::window::spawn("/opt/obsos/bin/obsos --private");
+        crate::window::new_window(&["--private"]);
     }
     for name in crate::profile::Profile::list() {
         ui.horizontal(|ui| {
             ui.label(if name == shell.profile.name { format!("● {name} (открыт)") } else { name.clone() });
             if name != shell.profile.name && ui.small_button("открыть").clicked() {
-                let _ = crate::window::spawn(&format!("/opt/obsos/bin/obsos --profile {name}"));
+                crate::window::new_window(&["--profile", &name]);
             }
         });
     }
@@ -1606,7 +1609,7 @@ fn profiles(ui: &mut Ui, shell: &mut Shell) {
         ui.add(egui::TextEdit::singleline(&mut shell.new_profile).hint_text("имя нового профиля").desired_width(180.0));
         if ui.button("Создать и открыть").clicked() && !shell.new_profile.trim().is_empty() {
             let name: String = shell.new_profile.chars().filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_').collect();
-            let _ = crate::window::spawn(&format!("/opt/obsos/bin/obsos --profile {name}"));
+            crate::window::new_window(&["--profile", &name]);
             shell.new_profile.clear();
         }
     });
