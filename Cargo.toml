@@ -13,8 +13,9 @@ default-members = ["obsos-desktop"]
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-# Как у FossAi, откуда код пришёл; сменить может только владелец.
-license = "GPL-3.0-only"
+# Свой код OBSOS — на выбор MIT или Apache-2.0 (LICENSE-MIT, LICENSE-APACHE);
+# сторонний код — под своими лицензиями (docs/NOTICE.md).
+license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 # Servo — с crates.io, ровно та версия, что у FossAi (Cargo.lock общий).

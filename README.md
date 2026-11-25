@@ -5,7 +5,7 @@
 свой репозиторий GitHub/GitLab/Bitbucket, Яндекс Диск, Google Диск, WebDAV или
 папку, загрузки, блокировка рекламы, режим чтения, инструменты разработчика,
 пользовательские скрипты и стили). Родился внутри ОС
-[FossAi](../FreeOpenSourseSystemAI) и вынесен оттуда 25.11.2026, чтобы его можно было
+[FossAi](https://github.com/anomal3/FreeOpenSourceSystemAI) и вынесен оттуда 25.11.2026, чтобы его можно было
 разрабатывать и отлаживать прямо на Windows (и Linux), а в FossAi подключать
 готовым.
 
@@ -98,3 +98,29 @@ docker run --rm -v <FossAi>:/work -v <OBSOS>:/obsos -v fossai-servo:/cache \
 * Рисование программное (как на FossAi): на больших окнах медленнее
   настоящих браузеров. GPU-путь Servo (surfman/ANGLE) — отдельная работа.
 * «Открыть в Chromium» на Windows/Linux открывает браузер системы по умолчанию.
+
+## Лицензия
+
+Свой код OBSOS — © 2026 Roman <anomal3@yandex.ru>, на выбор под одной из
+двух лицензий:
+
+* MIT — [LICENSE-MIT](LICENSE-MIT);
+* Apache License 2.0 — [LICENSE-APACHE](LICENSE-APACHE).
+
+Пользоваться, менять и встраивать OBSOS в свои программы (в том числе
+закрытые) можно свободно, сохраняя уведомление об авторстве. Если не
+сказано иначе, присланный в проект код тоже лицензируется как
+`MIT OR Apache-2.0`, без дополнительных условий.
+
+Сторонний код остаётся под своими лицензиями (полный список — в
+[docs/NOTICE.md](docs/NOTICE.md), страница `obsos://licenses`):
+
+* движок **Servo** 0.8 (зависимость с crates.io), SpiderMonkey, swgl/WebRender
+  — MPL-2.0. Правки крейтов Servo, которые вносит `cargo xtask vendor`, и
+  `patches/fonts/font_list.rs` — тоже MPL-2.0 (MPL действует пофайлово:
+  исправленные файлы Servo остаются под MPL, остальной код OBSOS — нет);
+* `third_party/egui-software-backend` — копия крейта
+  [egui_software_backend](https://github.com/DGriffin91/egui_software_backend)
+  (© DGriffin91) с правкой, MIT или Apache-2.0, файлы лицензий лежат рядом;
+* дизайн оболочки — по мотивам [Zervo](https://github.com/Goddv/Zervo)
+  (© Goddv, MPL-2.0); код оболочки свой.

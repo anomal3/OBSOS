@@ -3,7 +3,7 @@ name = "browser-sync"
 description = "Browser sync core (ROADMAP N10): per-device append-only op logs with hybrid logical clocks, last-writer-wins merge with tombstones, snapshots and tombstone GC over a pluggable file store."
 version = "0.8.0"
 edition = "2024"
-license = "GPL-3.0-only"
+license = "MIT OR Apache-2.0"
 rust-version = "1.85"
 
 # Зависимостей нет намеренно: ядро синхронизации — чистая логика над строками,
