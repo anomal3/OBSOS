@@ -1,3 +1,5 @@
 /target
 /vendor
-/xtask/target 
+/xtask/target
+/dist
+/target-dist 

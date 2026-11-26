@@ -149,7 +149,7 @@ impl Downloads {
     pub fn start(&self, request: Request) -> u64 {
         let ask = request.ask || self.ask_always.get();
         let (id, cancel, rx) = self.add(&request, State::Running);
-        println!("browser: download start {}", request.url);
+        println!("browser: download start {}", crate::logs::url(&request.url));
         let items = self.items.clone();
         let dir = self.dir.borrow().clone();
         let _ = std::thread::Builder::new().name(String::from("obsos-download")).spawn(move || {
@@ -177,7 +177,7 @@ impl Downloads {
             let o = match opened {
                 Ok(o) => o,
                 Err(e) => {
-                    println!("browser: probe {}: {e} — page", request.url);
+                    println!("browser: probe {}: {} — page", crate::logs::url(&request.url), crate::logs::scrub(&e));
                     return page(&items);
                 }
             };
@@ -188,7 +188,7 @@ impl Downloads {
             if !(200..300).contains(&o.status) || !is_download(&o) {
                 return page(&items);
             }
-            println!("browser: probe {} → file {} ({}, {})", request.url, o.file_name(), o.mime(), if o.attachment() { "attachment" } else { "inline" });
+            println!("browser: probe {} → file {} ({}, {})", crate::logs::url(&request.url), crate::logs::text(&o.file_name()), o.mime(), if o.attachment() { "attachment" } else { "inline" });
             set_state(&items, id, State::Running);
             run(items, id, o, None, ask, dir, rx, cancel);
         });
@@ -322,8 +322,8 @@ fn set_state(items: &Arc<Mutex<Vec<Item>>>, id: u64, state: State) {
 
 fn finish(items: &Arc<Mutex<Vec<Item>>>, id: u64, state: State) {
     match &state {
-        State::Done(path) => println!("browser: download done {}", path.display()),
-        State::Failed(e) => println!("browser: download failed: {e}"),
+        State::Done(path) => println!("browser: download done {}", crate::logs::text(&path.display().to_string())),
+        State::Failed(e) => println!("browser: download failed: {}", crate::logs::scrub(e)),
         State::Cancelled => println!("browser: download cancelled"),
         _ => {}
     }
@@ -381,7 +381,7 @@ fn run(
         item.started = Instant::now();
         item.rate_at = (Instant::now(), 0);
     }
-    println!("browser: download to {} ({})", path.display(), total.map(|t| format!("{t} bytes")).unwrap_or_else(|| String::from("size unknown")));
+    println!("browser: download to {} ({})", crate::logs::text(&path.display().to_string()), total.map(|t| format!("{t} bytes")).unwrap_or_else(|| String::from("size unknown")));
     let progress = |got: u64, total: Option<u64>| {
         if let Some(item) = items.lock().expect("downloads").iter_mut().find(|i| i.id == id) {
             let (at, before) = item.rate_at;
@@ -402,13 +402,13 @@ fn run(
         // что гигабайт идёт, а не стоит).
         let step = got / (100 * 1024 * 1024);
         if step > 0 && step != last_log.replace(step) {
-            println!("browser: download {shown} {} MiB", got / (1024 * 1024));
+            println!("browser: download {} {} MiB", crate::logs::text(&shown), got / (1024 * 1024));
         }
     };
     match opened.save(&part, &logged, &cancel) {
         Ok((bytes, sha)) => match std::fs::rename(&part, &path) {
             Ok(()) => {
-                println!("browser: download saved {} ({bytes} bytes, sha256 {sha})", path.display());
+                println!("browser: download saved {} ({bytes} bytes, sha256 {sha})", crate::logs::text(&path.display().to_string()));
                 if let Some(item) = items.lock().expect("downloads").iter_mut().find(|i| i.id == id) {
                     item.sha256 = Some(sha);
                 }
@@ -436,14 +436,26 @@ pub fn looks_like_file(url: &url::Url) -> bool {
     last.rsplit_once('.').is_some_and(|(_, ext)| EXT.contains(&ext.to_ascii_lowercase().as_str()))
 }
 
-/// Адрес, по которому явно страница (проверять заголовки незачем).
-pub fn surely_page(url: &url::Url) -> bool {
-    let last = url.path_segments().and_then(|mut s| s.next_back()).unwrap_or("");
-    if last.is_empty() && url.query().is_none() {
+/// Стоит ли до загрузки документа проверить заголовки ответа: адрес похож на
+/// выдачу файла (`Content-Disposition: attachment`). Проверка задерживает
+/// переход на лишний запрос, поэтому обычные страницы идут сразу; то, что
+/// Servo показать не умеет, всё равно уйдёт в загрузки после ответа
+/// («Unknown content type», `Shell::check_unknown_type`).
+pub fn maybe_download(url: &url::Url) -> bool {
+    let path = url.path().to_ascii_lowercase();
+    let query = url.query().unwrap_or("").to_ascii_lowercase();
+    const PATH: &[&str] = &["download", "attachment", "/dl/", "/export", "/getfile", "get_file", "getattachment"];
+    const QUERY: &[&str] = &["download", "attachment", "filename=", "export=", "response-content-disposition", "dl=1"];
+    if PATH.iter().any(|m| path.contains(m)) || QUERY.iter().any(|m| query.contains(m)) {
         return true;
     }
-    last.rsplit_once('.').is_some_and(|(_, ext)| {
-        matches!(ext.to_ascii_lowercase().as_str(), "html" | "htm" | "xhtml" | "shtml" | "css" | "js" | "json" | "svg" | "png" | "jpg" | "jpeg" | "gif" | "webp" | "txt" | "md" | "xml")
+    // Незнакомое расширение (`report.dat`, `backup.sql`) — тоже проверить.
+    let last = path.rsplit('/').next().unwrap_or("");
+    last.rsplit_once('.').is_some_and(|(name, ext)| {
+        !name.is_empty()
+            && ext.len() <= 8
+            && ext.chars().all(|c| c.is_ascii_alphanumeric())
+            && matches!(ext, "sql" | "csv" | "dat" | "log" | "ics" | "vcf" | "gpx" | "kml" | "sig" | "asc" | "sha256" | "md5" | "patch" | "diff")
     })
 }
 
@@ -482,9 +494,14 @@ mod tests {
         assert!(!renderable_mime("application/pdf"));
         assert!(!renderable_mime("video/mp4"));
         assert!(!renderable_mime("image/x-photoshop"));
-        let u = url::Url::parse("https://x.org/").unwrap();
-        assert!(surely_page(&u));
-        assert!(!surely_page(&url::Url::parse("https://x.org/get?id=1").unwrap()));
-        assert!(!surely_page(&url::Url::parse("https://x.org/download.php").unwrap()));
+        let check = |s: &str| maybe_download(&url::Url::parse(s).unwrap());
+        assert!(!check("https://x.org/"));
+        assert!(!check("https://github.com/anomal3/OBSOS"));
+        assert!(!check("https://x.org/search?q=rust"));
+        assert!(!check("https://x.org/index.php"));
+        assert!(check("https://x.org/download.php"));
+        assert!(check("http://10.0.2.2:8000/dl/report"));
+        assert!(check("https://x.org/get?download=1"));
+        assert!(check("https://x.org/backup.sql"));
     }
 }

@@ -1,41 +1,80 @@
-//! OBSOS для Windows и Linux: окно winit, кадр — softbuffer.
+//! OBSOS для Windows и Linux: окно winit.
 //!
-//! Рисует всё `obsos-core` (страницу — swgl, оболочку — egui в пиксели), как
-//! на FossAi; здесь только окно, перевод событий winit в события окна FossAi
+//! Рисует всё `obsos-core`: видеокартой прямо в окно (Windows) или программно,
+//! как на FossAi, а кадр тогда показывает softbuffer; здесь только окно, перевод событий winit в события окна FossAi
 //! (`obsos_core::window::WinEvent`) и службы системы (`platform.rs`).
 //!
-//! `obsos [--profile <имя>] [--private] [адрес]`
+//! `obsos [--profile <имя>] [--private] [--console] [адрес]`
 
+// Без чёрного окна консоли рядом с браузером; журнал — в файл или туда, куда
+// перенаправлен вывод (`output.rs`).
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
+mod output;
 mod platform;
 
+// Подсказка драйверам NVIDIA/AMD: рисовать на дискретной видеокарте.
+surfman::declare_surfman!();
+
 use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::num::NonZeroU32;
 use std::rc::Rc;
 use std::time::Duration;
 
 use obsos_core::window::*;
 use winit::application::ApplicationHandler;
-use winit::dpi::PhysicalSize;
+use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 use winit::platform::pump_events::{EventLoopExtPumpEvents, PumpStatus};
+use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
 use winit::window::{CursorIcon, Window as WinitWindow, WindowAttributes, WindowId};
 
-/// Приёмник событий winit: окно создаётся в `resumed`, события копятся в
-/// очереди в кодировке окна FossAi.
+/// Приёмник событий winit: события каждого окна копятся в своей очереди в
+/// кодировке окна FossAi; окна создаются по запросу из цикла событий.
+#[derive(Default)]
 struct Handler {
-    attributes: Option<WindowAttributes>,
-    window: Option<Rc<WinitWindow>>,
+    /// Какое окно создать.
+    wanted: Option<WindowAttributes>,
+    created: Option<Rc<WinitWindow>>,
+    windows: HashMap<WindowId, Queue>,
+}
+
+impl Handler {
+    fn create(&mut self, event_loop: &ActiveEventLoop) {
+        if let Some(attributes) = self.wanted.take() {
+            match event_loop.create_window(attributes) {
+                Ok(w) => {
+                    self.windows.insert(w.id(), Queue::default());
+                    self.created = Some(Rc::new(w));
+                }
+                Err(e) => println!("browser: window open failed: {e}"),
+            }
+        }
+    }
+}
+
+/// Очередь и состояние ввода одного окна.
+#[derive(Default)]
+struct Queue {
     queue: VecDeque<WinEvent>,
     mods: ModifiersState,
     pointer: (i32, i32),
     /// Остаток прокрутки тачпада в точках (строка — 40 точек).
     wheel_rest: f64,
+    /// Дробные строки колёс с мелким шагом (по вертикали и горизонтали).
+    line_rest: (f32, f32),
+    /// Окно надо перерисовать (развернули, вернули на передний план).
+    exposed: bool,
+    /// Окно получило ввод.
+    focused: bool,
+    /// Цикл событий закончился — `WIN_CLOSE` уже в очереди.
+    closed: bool,
 }
 
-impl Handler {
+impl Queue {
     fn mask(&self) -> i32 {
         (self.mods.shift_key() as i32) | ((self.mods.control_key() as i32) << 1) | ((self.mods.alt_key() as i32) << 2)
     }
@@ -144,20 +183,46 @@ fn latin(key: PhysicalKey) -> u32 {
     c as u32
 }
 
+/// Shift/Ctrl/Alt, зажатые прямо сейчас (маска `WinEvent`): Ctrl+колесо
+/// должно работать, даже если нажатие клавиши досталось не нашему окну.
+#[cfg(windows)]
+fn held_modifiers() -> Option<i32> {
+    #[link(name = "user32")]
+    extern "system" {
+        fn GetAsyncKeyState(key: i32) -> i16;
+    }
+    // SAFETY: функция только читает состояние клавиатуры.
+    let down = |key: i32| unsafe { GetAsyncKeyState(key) } < 0;
+    // VK_SHIFT, VK_CONTROL, VK_MENU.
+    Some(down(0x10) as i32 | (down(0x11) as i32) << 1 | (down(0x12) as i32) << 2)
+}
+
+#[cfg(not(windows))]
+fn held_modifiers() -> Option<i32> {
+    None
+}
+
 impl ApplicationHandler for Handler {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.window.is_some() {
-            return;
-        }
-        if let Some(attributes) = self.attributes.take() {
-            match event_loop.create_window(attributes) {
-                Ok(w) => self.window = Some(Rc::new(w)),
-                Err(e) => println!("browser: window open failed: {e}"),
-            }
-        }
+        self.create(event_loop);
     }
 
-    fn window_event(&mut self, _event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.create(event_loop);
+    }
+
+    fn window_event(&mut self, _event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        if let Some(queue) = self.windows.get_mut(&id) {
+            queue.event(event);
+        }
+    }
+}
+
+impl Queue {
+    fn event(&mut self, event: WindowEvent) {
+        if matches!(event, WindowEvent::Focused(true)) {
+            self.focused = true;
+        }
         match event {
             WindowEvent::CloseRequested => self.push(WIN_CLOSE, 0, 0, 0),
             WindowEvent::Resized(size) => {
@@ -175,26 +240,38 @@ impl ApplicationHandler for Handler {
                     MouseButton::Left => 1,
                     MouseButton::Right => 2,
                     MouseButton::Middle => 3,
+                    MouseButton::Back => 4,
+                    MouseButton::Forward => 5,
                     _ => return,
                 };
                 let kind = if state == ElementState::Pressed { WIN_POINTER } else { WIN_RELEASE };
                 self.push(kind, code, self.pointer.0, self.pointer.1);
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                let lines = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => y.round() as i32,
+                let (lines, across) = match delta {
+                    MouseScrollDelta::LineDelta(x, y) => {
+                        // Колёса с мелким шагом шлют доли строки — копим, а не
+                        // отбрасываем.
+                        self.line_rest.0 += y;
+                        self.line_rest.1 += x;
+                        let (lines, across) = (self.line_rest.0.trunc(), self.line_rest.1.trunc());
+                        self.line_rest = (self.line_rest.0 - lines, self.line_rest.1 - across);
+                        (lines as i32, across as i32)
+                    }
                     MouseScrollDelta::PixelDelta(p) => {
                         self.wheel_rest += p.y;
                         let lines = (self.wheel_rest / 40.0).trunc();
                         self.wheel_rest -= lines * 40.0;
-                        lines as i32
+                        (lines as i32, (p.x / 40.0).round() as i32)
                     }
                 };
-                if lines != 0 {
-                    self.push(WIN_WHEEL, 0, lines, 0);
+                if lines != 0 || across != 0 {
+                    let mods = WIN_WHEEL_MODS | held_modifiers().unwrap_or_else(|| self.mask()) as u32;
+                    self.push(WIN_WHEEL, mods, lines, across);
                 }
             }
             WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
+            WindowEvent::RedrawRequested | WindowEvent::Occluded(false) | WindowEvent::Focused(true) => self.exposed = true,
             WindowEvent::KeyboardInput { event, .. } => {
                 let kind = if event.state == ElementState::Pressed { WIN_KEY } else { WIN_KEYUP };
                 let Some(mut code) = key_code(&event.logical_key, event.text.as_deref()) else { return };
@@ -213,70 +290,126 @@ impl ApplicationHandler for Handler {
     }
 }
 
-/// Окно OBSOS на winit.
-struct DesktopWindow {
-    event_loop: RefCell<EventLoop<()>>,
-    handler: RefCell<Handler>,
-    window: Rc<WinitWindow>,
-    surface: RefCell<softbuffer::Surface<Rc<WinitWindow>, Rc<WinitWindow>>>,
-    width: Cell<u32>,
-    height: Cell<u32>,
-    cursor: Cell<CursorShape>,
-    closed: Cell<bool>,
+/// Значок окна и панели задач (assets/icons).
+fn window_icon() -> Option<winit::window::Icon> {
+    let decoder = png::Decoder::new(std::io::Cursor::new(&include_bytes!("../../assets/icons/obsos-64.png")[..]));
+    let mut reader = decoder.read_info().ok()?;
+    let mut data = vec![0; reader.output_buffer_size()?];
+    let info = reader.next_frame(&mut data).ok()?;
+    if info.color_type != png::ColorType::Rgba || info.bit_depth != png::BitDepth::Eight {
+        return None;
+    }
+    data.truncate(info.buffer_size());
+    winit::window::Icon::from_rgba(data, info.width, info.height).ok()
 }
 
-impl DesktopWindow {
-    fn open(title: &str, width: u32, height: u32) -> Option<DesktopWindow> {
-        let mut event_loop = EventLoop::new().map_err(|e| println!("browser: event loop: {e}")).ok()?;
-        let attributes = WindowAttributes::default().with_title(title).with_inner_size(PhysicalSize::new(width, height));
-        let mut handler = Handler {
-            attributes: Some(attributes),
-            window: None,
-            queue: VecDeque::new(),
-            mods: ModifiersState::empty(),
-            pointer: (0, 0),
-            wheel_rest: 0.0,
-        };
-        // Окно появляется в `resumed` первого витка.
-        for _ in 0..100 {
-            let _ = event_loop.pump_app_events(Some(Duration::from_millis(10)), &mut handler);
-            if handler.window.is_some() {
-                break;
-            }
-        }
-        let window = handler.window.clone()?;
-        let context = softbuffer::Context::new(window.clone()).map_err(|e| println!("browser: softbuffer: {e}")).ok()?;
-        let surface = softbuffer::Surface::new(&context, window.clone()).map_err(|e| println!("browser: surface: {e}")).ok()?;
-        let size = window.inner_size();
-        // Размер, который уже есть, — не событие.
-        handler.queue.retain(|e| e.kind != WIN_RESIZE);
-        println!("browser: window {}x{} (scale {})", size.width, size.height, window.scale_factor());
-        let this = DesktopWindow {
-            event_loop: RefCell::new(event_loop),
-            handler: RefCell::new(handler),
-            window,
-            surface: RefCell::new(surface),
-            width: Cell::new(size.width.max(1)),
-            height: Cell::new(size.height.max(1)),
-            cursor: Cell::new(CursorShape::Arrow),
-            closed: Cell::new(false),
-        };
-        this.resize_surface();
-        Some(this)
-    }
+/// Общий на все окна цикл событий (winit даёт только один).
+struct Shared {
+    event_loop: RefCell<EventLoop<()>>,
+    handler: RefCell<Handler>,
+}
 
-    fn resize_surface(&self) -> bool {
-        let (Some(w), Some(h)) = (NonZeroU32::new(self.width.get()), NonZeroU32::new(self.height.get())) else { return false };
-        self.surface.borrow_mut().resize(w, h).is_ok()
-    }
-
+impl Shared {
     fn pump(&self, timeout: Duration) {
         let mut handler = self.handler.borrow_mut();
         let status = self.event_loop.borrow_mut().pump_app_events(Some(timeout), &mut *handler);
         if let PumpStatus::Exit(_) = status {
-            if !self.closed.replace(true) {
-                handler.push(WIN_CLOSE, 0, 0, 0);
+            for queue in handler.windows.values_mut() {
+                if !std::mem::replace(&mut queue.closed, true) {
+                    queue.push(WIN_CLOSE, 0, 0, 0);
+                }
             }
+        }
+    }
+
+    /// Создать окно: дождаться, пока цикл событий это сделает.
+    fn create(&self, attributes: WindowAttributes) -> Option<Rc<WinitWindow>> {
+        self.handler.borrow_mut().wanted = Some(attributes);
+        for _ in 0..100 {
+            self.pump(Duration::from_millis(10));
+            if let Some(window) = self.handler.borrow_mut().created.take() {
+                return Some(window);
+            }
+        }
+        None
+    }
+}
+
+/// Окно OBSOS на winit.
+struct DesktopWindow {
+    shared: Rc<Shared>,
+    window: Rc<WinitWindow>,
+    /// Только для программного вывода — создаётся при первом кадре: окну,
+    /// в которое рисует видеокарта, он не нужен.
+    surface: RefCell<Option<softbuffer::Surface<Rc<WinitWindow>, Rc<WinitWindow>>>>,
+    width: Cell<u32>,
+    height: Cell<u32>,
+    cursor: Cell<CursorShape>,
+}
+
+impl DesktopWindow {
+    /// Первое окно и общий цикл событий.
+    fn open(title: &str, width: u32, height: u32) -> Option<DesktopWindow> {
+        let event_loop = EventLoop::new().map_err(|e| println!("browser: event loop: {e}")).ok()?;
+        let shared = Rc::new(Shared { event_loop: RefCell::new(event_loop), handler: Default::default() });
+        DesktopWindow::on(shared, title, width, height, None)
+    }
+
+    /// Окно в общем цикле событий.
+    fn on(shared: Rc<Shared>, title: &str, width: u32, height: u32, at: Option<(i32, i32)>) -> Option<DesktopWindow> {
+        let mut attributes = WindowAttributes::default().with_title(title).with_inner_size(PhysicalSize::new(width, height)).with_window_icon(window_icon());
+        if let Some((x, y)) = at {
+            attributes = attributes.with_position(PhysicalPosition::new(x, y));
+        }
+        let window = shared.create(attributes)?;
+        let size = window.inner_size();
+        // Размер, который уже есть, — не событие.
+        if let Some(queue) = shared.handler.borrow_mut().windows.get_mut(&window.id()) {
+            queue.queue.retain(|e| e.kind != WIN_RESIZE);
+        }
+        println!("browser: window {}x{} (scale {})", size.width, size.height, window.scale_factor());
+        Some(DesktopWindow {
+            shared,
+            window,
+            surface: RefCell::new(None),
+            width: Cell::new(size.width.max(1)),
+            height: Cell::new(size.height.max(1)),
+            cursor: Cell::new(CursorShape::Arrow),
+        })
+    }
+
+    /// Очередь этого окна.
+    fn queue<T>(&self, f: impl FnOnce(&mut Queue) -> T) -> Option<T> {
+        self.shared.handler.borrow_mut().windows.get_mut(&self.window.id()).map(f)
+    }
+
+    fn resize_surface(&self) -> bool {
+        let (Some(w), Some(h)) = (NonZeroU32::new(self.width.get()), NonZeroU32::new(self.height.get())) else { return false };
+        match self.surface.borrow_mut().as_mut() {
+            Some(surface) => surface.resize(w, h).is_ok(),
+            None => true,
+        }
+    }
+
+    fn make_surface(&self) {
+        if self.surface.borrow().is_some() {
+            return;
+        }
+        let made = softbuffer::Context::new(self.window.clone()).and_then(|context| softbuffer::Surface::new(&context, self.window.clone()));
+        match made {
+            Ok(surface) => {
+                *self.surface.borrow_mut() = Some(surface);
+                self.resize_surface();
+            }
+            Err(e) => println!("browser: softbuffer: {e}"),
+        }
+    }
+}
+
+impl Drop for DesktopWindow {
+    fn drop(&mut self) {
+        if let Ok(mut handler) = self.shared.handler.try_borrow_mut() {
+            handler.windows.remove(&self.window.id());
         }
     }
 }
@@ -296,10 +429,10 @@ impl HostWindow for DesktopWindow {
     }
 
     fn next_event(&self) -> Option<WinEvent> {
-        if self.handler.borrow().queue.is_empty() {
-            self.pump(Duration::ZERO);
+        if self.queue(|q| q.queue.is_empty()) == Some(true) {
+            self.shared.pump(Duration::ZERO);
         }
-        self.handler.borrow_mut().queue.pop_front()
+        self.queue(|q| q.queue.pop_front()).flatten()
     }
 
     fn resize(&self, width: u32, height: u32) -> bool {
@@ -327,7 +460,9 @@ impl HostWindow for DesktopWindow {
     }
 
     fn present(&self, draw: &mut dyn FnMut(&mut [u32])) {
+        self.make_surface();
         let mut surface = self.surface.borrow_mut();
+        let Some(surface) = surface.as_mut() else { return };
         let Ok(mut buffer) = surface.buffer_mut() else { return };
         let len = self.width.get() as usize * self.height.get() as usize;
         if buffer.len() < len {
@@ -348,9 +483,86 @@ impl HostWindow for DesktopWindow {
 
     fn idle(&self, time: Duration) {
         // Ждать событий окна, а не просто спать: ввод приходит сразу.
-        self.pump(time);
+        self.shared.pump(time);
+    }
+
+    fn scale_factor(&self) -> f32 {
+        self.window.scale_factor() as f32
+    }
+
+    fn geometry(&self) -> Option<(u32, u32, bool)> {
+        let size = self.window.inner_size();
+        (size.width > 0 && size.height > 0 && !self.window.is_minimized().unwrap_or(false)).then(|| (size.width, size.height, self.window.is_maximized()))
+    }
+
+    fn set_geometry(&self, width: u32, height: u32, maximized: bool) {
+        // Ответ придёт событием `Resized` — поверхность поменяет цикл.
+        let _ = self.window.request_inner_size(PhysicalSize::new(width, height));
+        if maximized {
+            self.window.set_maximized(true);
+        }
+    }
+
+    fn set_fullscreen(&self, on: bool) {
+        self.window.set_fullscreen(on.then(|| winit::window::Fullscreen::Borderless(None)));
+    }
+
+    fn gl_handles(&self) -> Option<(RawDisplayHandle, RawWindowHandle)> {
+        Some((self.window.display_handle().ok()?.as_raw(), self.window.window_handle().ok()?.as_raw()))
+    }
+
+    fn refresh_hz(&self) -> u32 {
+        let monitor = self.window.current_monitor().or_else(|| self.window.primary_monitor());
+        monitor.and_then(|m| m.refresh_rate_millihertz()).map(|m| (m + 500) / 1000).filter(|hz| *hz >= 30).unwrap_or(60)
+    }
+
+    fn take_exposed(&self) -> bool {
+        self.queue(|q| std::mem::take(&mut q.exposed)).unwrap_or(false)
+    }
+
+    fn open_window(&self, title: &str, width: u32, height: u32, at: Option<(i32, i32)>) -> Option<Rc<Window>> {
+        DesktopWindow::on(self.shared.clone(), title, width, height, at).map(|w| Rc::new(w) as Rc<Window>)
+    }
+
+    fn inner_origin(&self) -> Option<(i32, i32)> {
+        self.window.inner_position().ok().map(|p| (p.x, p.y))
+    }
+
+    fn set_position(&self, x: i32, y: i32) {
+        self.window.set_outer_position(PhysicalPosition::new(x, y));
+    }
+
+    fn focus(&self) {
+        self.window.focus_window();
+    }
+
+    fn take_focused(&self) -> bool {
+        self.queue(|q| std::mem::take(&mut q.focused)).unwrap_or(false)
+    }
+
+    fn waker(&self) -> Option<Box<dyn Fn() + Send + Sync>> {
+        // Пустое событие прерывает ожидание `pump_app_events`.
+        let proxy = self.shared.event_loop.borrow().create_proxy();
+        Some(Box::new(move || {
+            let _ = proxy.send_event(());
+        }))
     }
 }
+
+/// Паузы главного цикла и таймеры — с точностью 1 мс: по умолчанию Windows
+/// округляет их до 15,6 мс, и анимации оболочки шли рывками.
+#[cfg(windows)]
+fn fine_timer() {
+    #[link(name = "winmm")]
+    extern "system" {
+        fn timeBeginPeriod(period: u32) -> u32;
+    }
+    // SAFETY: просьба о точности таймера; система снимает её с процессом.
+    unsafe { timeBeginPeriod(1) };
+}
+
+#[cfg(not(windows))]
+fn fine_timer() {}
 
 fn main() {
     // Дом OBSOS (профили — `<дом>/.config/obsos`, загрузки — `<дом>/Downloads`):
@@ -361,6 +573,9 @@ fn main() {
             std::env::set_var("HOME", profile);
         }
     }
+    // До первой строки журнала.
+    output::setup();
+    fine_timer();
     obsos_core::window::install(Box::new(platform::Desktop::new()));
     obsos_core::run(|title, width, height| DesktopWindow::open(title, width, height).map(|w| Rc::new(w) as Rc<Window>))
 }

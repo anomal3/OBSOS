@@ -45,6 +45,8 @@ https://github.com/anomal3/FreeOpenSourceSystemAI
 | **SQLite** (`libsqlite3-sys`) | авторы SQLite | общественное достояние |
 | **Zstandard** (`zstd-sys`) | © Meta Platforms, Inc. | BSD-3-Clause |
 | **winit**, **softbuffer**, **arboard**, **rfd** (окно, кадр, буфер обмена и окна выбора файла в obsos-desktop) | © их авторы и участники | Apache-2.0 (winit); MIT или Apache-2.0 (softbuffer, arboard); MIT (rfd) |
+| **surfman** (OpenGL для рисования видеокартой), **gleam**, **png** | © их авторы и участники | MIT или Apache-2.0 (surfman, gleam); MIT или Apache-2.0 (png) |
+| **GStreamer** и его плагины — видео и звук (только сборка с фичей `video`; DLL рядом с программой) | © GStreamer и участники | LGPL-2.1-or-later (отдельные библиотеки динамически; плагины — по своим лицензиям) |
 
 Правки FossAi в SpiderMonkey (ОС `freeos` в сборке, `getentropy()` для
 случайности, видимость символов) лежат открыто в репозитории FossAi,

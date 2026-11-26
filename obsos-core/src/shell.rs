@@ -4,6 +4,7 @@
 use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -16,53 +17,148 @@ use servo::{
 };
 
 use crate::pages::{self, PageData};
-use crate::profile::{self, Look, Profile, now_ms};
-use crate::swgl_ctx::SwglRenderingContext;
+use crate::profile::{self, Look, Profile, TabsAt, now_ms};
+use crate::swgl_ctx::PageContext;
 use crate::syncer::{Done, Job, Syncer};
 use crate::vault::{self, Login, Vault};
 use crate::window::{self, Window};
 
 // ── Геометрия ───────────────────────────────────────────────────────────────
+//
+// Размеры оболочки — в точках интерфейса (как у egui); на экране точка
+// интерфейса — `ui_scale()` физических. Прямоугольник страницы (`page_area`)
+// — уже в физических точках окна.
 
-/// Полоса вкладок сверху (если вкладки не сбоку).
+/// Горизонтальная полоса вкладок (сверху или снизу).
 pub const TABSTRIP_H: u32 = 36;
 pub const TOOLBAR_H: u32 = 44;
 pub const TOOLBAR_H_COMPACT: u32 = 38;
 
+static SCALE: AtomicU32 = AtomicU32::new(0);
+
+/// Физических точек в точке интерфейса.
+pub fn ui_scale() -> f32 {
+    match SCALE.load(Ordering::Relaxed) {
+        0 => 1.0,
+        bits => f32::from_bits(bits),
+    }
+}
+
+pub fn set_ui_scale(scale: f32) {
+    SCALE.store(scale.clamp(0.5, 4.0).to_bits(), Ordering::Relaxed);
+}
+
+/// Точки интерфейса → физические.
+pub fn px(points: u32) -> u32 {
+    (points as f32 * ui_scale()).round() as u32
+}
+
+/// Страница на весь экран: оболочки не видно (F11, видео).
+static FULLSCREEN: AtomicBool = AtomicBool::new(false);
+
+pub fn fullscreen() -> bool {
+    FULLSCREEN.load(Ordering::Relaxed)
+}
+
+pub fn set_fullscreen(on: bool) {
+    FULLSCREEN.store(on, Ordering::Relaxed);
+}
+
+/// Отступы оболочки от краёв окна в точках интерфейса: слева, сверху,
+/// справа, снизу (с полосой загрузок и инструментами разработчика).
+pub fn chrome_margins(look: &Look) -> (u32, u32, u32, u32) {
+    if fullscreen() {
+        return (0, 0, 0, 0);
+    }
+    let bar = if look.compact { TOOLBAR_H_COMPACT } else { TOOLBAR_H };
+    let (left, top, right, bottom) = match look.tabs {
+        TabsAt::Left => (look.sidebar_width, bar, 0, 0),
+        TabsAt::Right => (0, bar, look.sidebar_width, 0),
+        TabsAt::Top => (0, TABSTRIP_H + bar, 0, 0),
+        TabsAt::Bottom => (0, bar, 0, TABSTRIP_H),
+    };
+    (left, top, right + dev_dock(), bottom + downloads_bar() + dev_dock_bottom())
+}
+
+/// Высота инструментов разработчика, закреплённых снизу.
+static DEV_DOCK_BOTTOM: AtomicU32 = AtomicU32::new(0);
+
+pub fn dev_dock_bottom() -> u32 {
+    DEV_DOCK_BOTTOM.load(Ordering::Relaxed)
+}
+
+pub fn set_dev_dock_bottom(points: u32) {
+    DEV_DOCK_BOTTOM.store(points, Ordering::Relaxed);
+}
+
+/// Прямоугольник страницы в окне `w × h`: x, y, ширина, высота (физические).
+pub fn page_area(look: &Look, w: u32, h: u32) -> (u32, u32, u32, u32) {
+    let (l, t, r, b) = chrome_margins(look);
+    let (x, y) = (px(l).min(w), px(t).min(h));
+    (x, y, w.saturating_sub(x + px(r)).max(1), h.saturating_sub(y + px(b)).max(1))
+}
+
+/// Масштаб страницы (`devicePixelRatio`): как у оболочки; на узком экране
+/// телефона — 2.
+pub fn page_scale() -> f32 {
+    if crate::app::MOBILE.load(Ordering::Relaxed) { 2.0 } else { ui_scale() }
+}
+
 /// Где страница: левый верхний угол её прямоугольника в окне.
 pub fn page_origin(look: &Look) -> (u32, u32) {
-    let bar = if look.compact { TOOLBAR_H_COMPACT } else { TOOLBAR_H };
-    if look.side_tabs { (look.sidebar_width, bar) } else { (0, TABSTRIP_H + bar) }
+    let (l, t, _, _) = chrome_margins(look);
+    (px(l), px(t))
 }
 
 pub fn page_size(look: &Look, w: u32, h: u32) -> dpi::PhysicalSize<u32> {
-    let (x, y) = page_origin(look);
-    dpi::PhysicalSize::new(w.saturating_sub(x).saturating_sub(dev_dock()).max(1), h.saturating_sub(y).saturating_sub(downloads_bar()).max(1))
+    let (_, _, w, h) = page_area(look, w, h);
+    dpi::PhysicalSize::new(w, h)
 }
 
 /// Полоса загрузок внизу окна (как в Chrome): страница на столько ниже.
 /// Ноль — полоса скрыта.
 pub const DOWNLOADS_BAR_H: u32 = 52;
-static DOWNLOADS_BAR: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static DOWNLOADS_BAR: AtomicU32 = AtomicU32::new(0);
 
 pub fn downloads_bar() -> u32 {
-    DOWNLOADS_BAR.load(std::sync::atomic::Ordering::Relaxed)
+    DOWNLOADS_BAR.load(Ordering::Relaxed)
 }
 
-pub fn set_downloads_bar(px: u32) {
-    DOWNLOADS_BAR.store(px, std::sync::atomic::Ordering::Relaxed);
+pub fn set_downloads_bar(points: u32) {
+    DOWNLOADS_BAR.store(points, Ordering::Relaxed);
 }
 
 /// Ширина инструментов разработчика, встроенных справа (как в Chromium):
 /// страница на столько уже. Ноль — закрыты.
-static DEV_DOCK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static DEV_DOCK: AtomicU32 = AtomicU32::new(0);
 
 pub fn dev_dock() -> u32 {
-    DEV_DOCK.load(std::sync::atomic::Ordering::Relaxed)
+    DEV_DOCK.load(Ordering::Relaxed)
 }
 
-pub fn set_dev_dock(px: u32) {
-    DEV_DOCK.store(px, std::sync::atomic::Ordering::Relaxed);
+pub fn set_dev_dock(points: u32) {
+    DEV_DOCK.store(points, Ordering::Relaxed);
+}
+
+/// Размеры оболочки текущего окна: масштаб, полный экран, инструменты
+/// разработчика снизу, полоса загрузок, инструменты справа. У каждого окна
+/// свои — при переключении они меняются вместе с его полями (`windows.rs`).
+pub(crate) fn window_metrics() -> [u32; 5] {
+    [
+        SCALE.load(Ordering::Relaxed),
+        FULLSCREEN.load(Ordering::Relaxed) as u32,
+        DEV_DOCK_BOTTOM.load(Ordering::Relaxed),
+        DOWNLOADS_BAR.load(Ordering::Relaxed),
+        DEV_DOCK.load(Ordering::Relaxed),
+    ]
+}
+
+pub(crate) fn set_window_metrics([scale, full, bottom, bar, dock]: [u32; 5]) {
+    SCALE.store(scale, Ordering::Relaxed);
+    FULLSCREEN.store(full != 0, Ordering::Relaxed);
+    DEV_DOCK_BOTTOM.store(bottom, Ordering::Relaxed);
+    DOWNLOADS_BAR.store(bar, Ordering::Relaxed);
+    DEV_DOCK.store(dock, Ordering::Relaxed);
 }
 
 // ── События Servo → главный цикл ────────────────────────────────────────────
@@ -74,7 +170,8 @@ pub enum Note {
     Load(WebViewId, LoadStatus),
     Status(WebViewId, Option<String>),
     History,
-    Opened(WebView),
+    /// Страница открыла вкладку (`window.open`): она и вкладка-родитель.
+    Opened(WebView, WebViewId),
     Crashed(WebViewId, String),
     Control(WebViewId, EmbedderControl),
     HideControl(EmbedderControlId),
@@ -85,11 +182,21 @@ pub enum Note {
     Action(Action),
     /// Заблокирован запрос рекламы/трекера на странице.
     Blocked(WebViewId),
+    /// Сообщение страницы управления `obsos://settings` и подобных.
+    WebUi(WebViewId, String),
+    /// У страницы появился значок.
+    Favicon(WebViewId),
+    /// Страница просит весь экран (видео) или выходит из него.
+    Fullscreen(WebViewId, bool),
+    /// Сообщение агента инструментов разработчика.
+    DevTools(WebViewId, String),
+    /// Только перерисовать оболочку (пришёл ответ страницы).
+    Redraw,
 }
 
 pub struct Delegate {
     pub notes: RefCell<Vec<Note>>,
-    pub context: Rc<SwglRenderingContext>,
+    pub context: Rc<dyn PageContext>,
     /// Запасной буфер обмена (если ядро без SYS_CLIPBOARD); обычно — общий
     /// буфер системы (`window::clipboard_*`).
     pub clipboard: Rc<RefCell<String>>,
@@ -100,13 +207,41 @@ pub struct Delegate {
     pub downloads: Rc<crate::downloads::Downloads>,
     /// Консоль и сеть для инструментов разработчика (F12).
     pub devlog: RefCell<crate::devtools::DevLog>,
+    /// Инструменты разработчика открыты — новые записи перерисовывают их.
+    pub devtools_open: std::cell::Cell<bool>,
+    /// Вкладки, открытые самими страницами (`window.open`).
+    pub page_opened: RefCell<Vec<WebViewId>>,
     /// Запросы документов вкладок, ждущие проверки ссылки (файл или
     /// страница, `Shell::poll_downloads`).
     pub held_loads: RefCell<Vec<(WebViewId, servo::WebResourceLoad)>>,
 }
 
+impl Note {
+    /// Вкладка, к которой относится событие, — по ней оно уходит в своё окно.
+    pub fn view(&self) -> Option<WebViewId> {
+        match self {
+            Note::Frame(id)
+            | Note::Title(id, _)
+            | Note::Url(id, _)
+            | Note::Load(id, _)
+            | Note::Status(id, _)
+            | Note::Opened(_, id)
+            | Note::Crashed(id, _)
+            | Note::Control(id, _)
+            | Note::Auth(id, _)
+            | Note::Script(id, _)
+            | Note::Blocked(id)
+            | Note::WebUi(id, _)
+            | Note::Favicon(id)
+            | Note::Fullscreen(id, _)
+            | Note::DevTools(id, _) => Some(*id),
+            Note::History | Note::HideControl(_) | Note::Action(_) | Note::Redraw => None,
+        }
+    }
+}
+
 impl Delegate {
-    fn note(&self, note: Note) {
+    pub(crate) fn note(&self, note: Note) {
         self.notes.borrow_mut().push(note);
     }
 }
@@ -120,6 +255,10 @@ const SCRIPT_PREFIX: &str = "__obsos__:";
 /// `kmsg: ` into its log (`user::syscall::write`) — one write per line.
 pub fn klog(text: &str) {
     use std::io::Write;
+    if crate::logs::private() {
+        return;
+    }
+    let text = &crate::logs::scrub(text);
     println!("{text}");
     let short: String = text.chars().take(300).collect();
     let line = format!("kmsg: {}\n", short.replace('\n', " "));
@@ -137,16 +276,18 @@ impl WebViewDelegate for Delegate {
     }
 
     fn notify_page_title_changed(&self, webview: WebView, title: Option<String>) {
-        println!("browser: title {title:?}");
+        if !crate::logs::private() {
+            println!("browser: title {title:?}");
+        }
         self.note(Note::Title(webview.id(), title));
     }
 
     fn notify_url_changed(&self, webview: WebView, url: url::Url) {
         let shown = url.as_str();
-        println!("browser: url {}", if shown.starts_with("data:") { "data:…" } else { shown });
+        println!("browser: url {}", crate::logs::url(shown));
         // The journal gets the address without query and fragment: they may
         // carry tokens (`?access_token=`, OAuth `#code=`).
-        if matches!(url.scheme(), "http" | "https") {
+        if matches!(url.scheme(), "http" | "https") && !crate::logs::private() {
             let _ = std::io::Write::write_all(
                 &mut std::io::stderr(),
                 format!("kmsg: browser: page {}://{}{}\n", url.scheme(), url.host_str().unwrap_or(""), url.path()).as_bytes(),
@@ -157,6 +298,14 @@ impl WebViewDelegate for Delegate {
 
     fn notify_status_text_changed(&self, webview: WebView, status: Option<String>) {
         self.note(Note::Status(webview.id(), status));
+    }
+
+    fn notify_favicon_changed(&self, webview: WebView) {
+        self.note(Note::Favicon(webview.id()));
+    }
+
+    fn notify_fullscreen_state_changed(&self, webview: WebView, on: bool) {
+        self.note(Note::Fullscreen(webview.id(), on));
     }
 
     fn notify_history_changed(&self, _webview: WebView, _entries: Vec<url::Url>, _current: usize) {
@@ -175,16 +324,38 @@ impl WebViewDelegate for Delegate {
             .clipboard_delegate(parent.clipboard_delegate())
             .user_content_manager(self.content.clone())
             .build();
-        self.note(Note::Opened(webview));
+        self.page_opened.borrow_mut().push(webview.id());
+        self.note(Note::Opened(webview, parent.id()));
     }
 
-    fn request_navigation(&self, _webview: WebView, request: NavigationRequest) {
+    fn request_navigation(&self, webview: WebView, request: NavigationRequest) {
         let url = request.url.clone();
+        // Переход затеяла веб-страница (в том числе открывшая новое окно):
+        // служебные страницы с адресом в параметрах и локальные файлы ей
+        // недоступны.
+        let from_web = match webview.url() {
+            Some(current) => !matches!(current.scheme(), "obsos" | "file" | "about" | "data"),
+            None => self.page_opened.borrow().contains(&webview.id()),
+        };
+        let internal = url.scheme() == "file" || (url.scheme() == "obsos" && matches!(url.host_str(), Some("action" | "unsupported" | "crashed" | "view")));
+        if from_web && internal {
+            request.deny();
+            return;
+        }
         if url.scheme() == "obsos" && url.host_str() == Some("action") {
+            // Команды оболочке — только со своих страниц (сайт мог бы так
+            // открывать адреса во внешнем браузере без ведома пользователя).
+            if !webview.url().is_some_and(|u| u.scheme() == "obsos") {
+                request.deny();
+                return;
+            }
             let target = url.query_pairs().find(|(k, _)| k == "url").map(|(_, v)| v.into_owned()).unwrap_or_default();
+            // Только веб-адреса: по `file:` и прочим система запускает
+            // программы.
+            let web = target.starts_with("http://") || target.starts_with("https://");
             let action = match url.path() {
-                "/chromium" => Some(Action::Chromium(target)),
-                "/force" => Some(Action::OpenUrl(target)),
+                "/chromium" if web => Some(Action::Chromium(target)),
+                "/force" if web => Some(Action::OpenUrl(target)),
                 _ => None,
             };
             request.deny();
@@ -235,7 +406,11 @@ impl WebViewDelegate for Delegate {
             main: request.is_for_main_frame,
             blocked,
             at: Instant::now(),
+            headers: request.headers.iter().map(|(k, v)| (k.to_string(), String::from_utf8_lossy(v.as_bytes()).into_owned())).collect(),
         });
+        if self.devtools_open.get() {
+            self.note(Note::Redraw);
+        }
         if blocked {
             let url = request.url.as_url().clone();
             let mut blocker = self.blocker.borrow_mut();
@@ -256,7 +431,7 @@ impl WebViewDelegate for Delegate {
             && !request.is_redirect
             && request.method.as_str() == "GET"
             && matches!(url.scheme(), "http" | "https")
-            && !crate::downloads::surely_page(url)
+            && crate::downloads::maybe_download(url)
         {
             self.held_loads.borrow_mut().push((webview.id(), load));
         }
@@ -278,6 +453,17 @@ impl WebViewDelegate for Delegate {
         if let Some(payload) = message.strip_prefix(SCRIPT_PREFIX) {
             self.note(Note::Script(webview.id(), payload.to_string()));
             return;
+        }
+        if let Some(payload) = message.strip_prefix(crate::webui::PREFIX) {
+            self.note(Note::WebUi(webview.id(), payload.to_string()));
+            return;
+        }
+        if let Some(payload) = message.strip_prefix("__obsos_dt__:") {
+            self.note(Note::DevTools(webview.id(), payload.to_string()));
+            return;
+        }
+        if self.devtools_open.get() {
+            self.note(Note::Redraw);
         }
         let level = format!("{level:?}");
         // Ошибки страниц — и в журнал системы: по нему видно, на чём сайт
@@ -386,8 +572,19 @@ window.addEventListener('unhandledrejection', function(e){ try { var r = e.reaso
 try {
   if (!('MediaSource' in window)) {
     var told = false;
+    // Плашку — только если видео есть, а играть так и не начало: многие
+    // плееры (vkvideo.ru) находят другой формат и играют без MediaSource.
+    var stuck = function(root){
+      var found = null;
+      root.querySelectorAll('*').forEach(function(e){
+        if (found === false) return;
+        if (e.tagName === 'VIDEO') found = !(e.readyState >= 2 || e.currentTime > 0);
+        else if (e.shadowRoot) { var inner = stuck(e.shadowRoot); if (inner !== null) found = inner; }
+      });
+      return found;
+    };
     Object.defineProperty(window, 'MediaSource', { configurable: true, get: function(){
-      if (!told) { told = true; send({t:'unsupported', what:'MediaSource'}); } return undefined; } });
+      if (!told) { told = true; setTimeout(function(){ if (stuck(document) === true) send({t:'unsupported', what:'MediaSource'}); }, 12000); } return undefined; } });
   }
 } catch(e) {}
 var last = '';
@@ -415,6 +612,69 @@ document.addEventListener('click', function(e){
   var a = e.target; while (a && a.tagName != 'A') a = a.parentElement;
   if (a && a.hasAttribute('download') && a.href && /^https?:/.test(a.href)) { e.preventDefault(); send({t:'download', url: a.href}); }
 }, true);
+// Два обхода пробелов движка, дорисовываются после загрузки и изменений:
+// 1) SVG растеризует отдельный движок без CSS — `fill="var(--x)"` выходил
+//    чёрным (github.com): подставляем вычисленные значения переменных;
+// 2) `background-clip: text` Servo не разбирает — «градиентный текст»
+//    (прозрачный цвет поверх градиента) был сплошным прямоугольником:
+//    красим буквы первым цветом градиента.
+try {
+  var PAINT = ['fill', 'stroke', 'stop-color', 'flood-color'];
+  var resolve = function(el, value, depth){
+    var m = /^\s*var\(\s*(--[^,\s)]+)\s*(?:,\s*([\s\S]*))?\)\s*$/.exec(value);
+    if (!m || depth > 4) return m ? '' : value;
+    var got = getComputedStyle(el).getPropertyValue(m[1]).trim() || (m[2] || '').trim();
+    return resolve(el, got, depth + 1);
+  };
+  var svgFix = function(){
+    var list = document.querySelectorAll('svg[fill^="var("], svg [fill^="var("], svg [stroke^="var("], svg [stop-color^="var("], svg [flood-color^="var("]');
+    var roots = [];
+    for (var i = 0; i < list.length && i < 600; i++) {
+      for (var k = 0; k < PAINT.length; k++) {
+        var v = list[i].getAttribute(PAINT[k]);
+        if (v && v.indexOf('var(') >= 0) { var to = resolve(list[i], v, 0); list[i].setAttribute(PAINT[k], to || 'none'); }
+      }
+      var root = list[i].closest ? list[i].closest('svg') : null;
+      if (root && roots.indexOf(root) < 0) roots.push(root);
+    }
+    // Растр SVG Servo пересчитывает только при изменении самого <svg>; у
+    // декоративных картинок фигуры, раскрашенные лишь классами CSS (растеризатор
+    // их не видит), без этого заливаются чёрным.
+    for (var r = 0; r < roots.length; r++) {
+      if (roots[r].getAttribute('aria-hidden') == 'true') {
+        var bare = roots[r].querySelectorAll('path[class]:not([fill]), rect[class]:not([fill])');
+        for (var b = 0; b < bare.length; b++) bare[b].setAttribute('fill', 'none');
+      }
+      roots[r].setAttribute('data-obsos-svg', String(Date.now() % 100000));
+    }
+  };
+  var textFix = function(){
+    var list = document.querySelectorAll('h1,h2,h3,h4,h5,span,a,p,strong,em,b,div');
+    for (var i = 0; i < list.length && i < 2500; i++) {
+      var el = list[i];
+      if (el.__obsosText || !el.firstChild) continue;
+      var s = getComputedStyle(el), bg = s.backgroundImage;
+      if (!bg || bg.indexOf('gradient(') < 0) continue;
+      if (!(s.color === 'transparent' || /^rgba\([^)]*,\s*0\)$/.test(s.color)) || !el.textContent.trim()) continue;
+      var stops = bg.match(/rgba?\([^)]*\)/g);
+      if (!stops) continue;
+      el.__obsosText = 1;
+      el.style.setProperty('background-image', 'none', 'important');
+      el.style.setProperty('color', stops[0], 'important');
+    }
+  };
+  var fixLater = 0, fixed = 0;
+  var fix = function(){ fixLater = 0; fixed++; try { svgFix(); textFix(); } catch(e) {} };
+  var plan = function(){ if (!fixLater && fixed < 25) fixLater = setTimeout(fix, 300 + fixed * 120); };
+  var watch = function(){
+    fix();
+    if (window.MutationObserver && document.body) new MutationObserver(function(records){
+      for (var i = 0; i < records.length; i++) if (records[i].addedNodes.length) { plan(); return; }
+    }).observe(document.body, {childList: true, subtree: true});
+  };
+  if (document.readyState == 'loading') document.addEventListener('DOMContentLoaded', watch); else watch();
+  window.addEventListener('load', plan);
+} catch(e) {}
 function probe(){ if (document.querySelector('input[type=password]')) send({t:'pwfield'}); }
 if (document.readyState == 'complete') probe(); else window.addEventListener('load', probe);
 })();"#;
@@ -450,6 +710,41 @@ pub struct Tab {
     pub zoom: f32,
     /// Сколько запросов рекламы/трекеров заблокировано на этой странице.
     pub blocked: u32,
+    pub favicon: Option<Favicon>,
+}
+
+/// Значок вкладки: картинка от Servo, затем текстура egui (делается при
+/// первом рисовании).
+pub enum Favicon {
+    Pending(egui::ColorImage),
+    Ready(egui::TextureHandle),
+}
+
+pub(crate) fn color_image(image: &servo::Image) -> Option<egui::ColorImage> {
+    use servo::PixelFormat as F;
+    let (w, h) = (image.width as usize, image.height as usize);
+    if w == 0 || h == 0 || w > 512 || h > 512 {
+        return None;
+    }
+    let data = image.data();
+    let bytes = match image.format {
+        F::K8 => 1,
+        F::KA8 => 2,
+        F::RGB8 => 3,
+        F::RGBA8 | F::BGRA8 => 4,
+    };
+    let mut pixels = Vec::with_capacity(w * h);
+    for p in data.chunks_exact(bytes).take(w * h) {
+        let (r, g, b, a) = match image.format {
+            F::K8 => (p[0], p[0], p[0], 255),
+            F::KA8 => (p[0], p[0], p[0], p[1]),
+            F::RGB8 => (p[0], p[1], p[2], 255),
+            F::RGBA8 => (p[0], p[1], p[2], p[3]),
+            F::BGRA8 => (p[2], p[1], p[0], p[3]),
+        };
+        pixels.push(egui::Color32::from_rgba_unmultiplied(r, g, b, a));
+    }
+    (pixels.len() == w * h).then(|| egui::ColorImage { size: [w, h], source_size: egui::vec2(w as f32, h as f32), pixels })
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -482,6 +777,8 @@ pub enum Action {
     ToggleBlockSite,
     /// Режим чтения: только текст статьи.
     Reader,
+    /// Ещё одно окно того же профиля (Ctrl+N).
+    NewWindow,
     /// Новое окно инкогнито (Ctrl+Shift+N): профиль во временном каталоге.
     PrivateWindow,
     /// Вернуть последнюю закрытую вкладку (Ctrl+Shift+T).
@@ -490,6 +787,24 @@ pub enum Action {
     Home,
     FindClose,
     Quit,
+    /// Открыть `obsos://<имя>` (или перейти на вкладку, где он уже открыт).
+    OpenPage(&'static str),
+    /// Новая вкладка, не переключаясь на неё.
+    OpenBackground(String),
+    Duplicate(usize),
+    CloseOthers(usize),
+    ReloadTab(usize),
+    /// Перетащить вкладку: откуда, куда.
+    MoveTab(usize, usize),
+    SetTabs(TabsAt),
+    Fullscreen,
+    /// Выбрать элемент страницы мышью (инструменты разработчика).
+    Inspect,
+    /// «Просмотреть код» элемента в точке окна (точки интерфейса).
+    InspectAt(f32, f32),
+    /// Инструменты разработчика сразу на консоли (Ctrl+Shift+J).
+    Console,
+    Toast(&'static str),
 }
 
 /// Состояние генератора паролей, проверки утечек, импорта и скачивания
@@ -557,12 +872,9 @@ var m=s.marks[s.i];m.style.background='#ff8a3d';m.scrollIntoView({{block:'center
 pub enum Panel {
     Menu,
     Bookmarks,
-    History,
     Passwords,
     RemoteTabs,
     Sync,
-    Looks,
-    Settings,
     Scripts,
     Profiles,
     Downloads,
@@ -621,7 +933,7 @@ pub struct SyncUi {
 
 pub struct Shell {
     pub servo: Servo,
-    pub context: Rc<SwglRenderingContext>,
+    pub context: Rc<dyn PageContext>,
     pub delegate: Rc<Delegate>,
     pub tabs: Vec<Tab>,
     pub active: usize,
@@ -650,6 +962,24 @@ pub struct Shell {
     pub closed: Vec<String>,
     pub quit: bool,
     pub dl: DownloadsUi,
+    /// Вкладки, адресная строка, меню (`chrome.rs`).
+    pub chrome: crate::chrome::ChromeState,
+    /// Страницы управления `obsos://…` (`webui_host.rs`).
+    pub webui: crate::webui_host::WebUi,
+    /// Ключ этого запуска, с которым страницы управления присылают команды.
+    pub ui_token: String,
+    /// Последний щелчок «в новую вкладку» (средняя кнопка, Ctrl+щелчок).
+    pub background_click: Option<Instant>,
+    /// Вкладка, чья страница заняла весь экран (видео).
+    pub page_fullscreen: Option<WebViewId>,
+    /// Платформа умеет рисовать страницы видеокартой / сейчас так и рисует.
+    pub gpu_available: bool,
+    pub gpu_active: bool,
+    pub renderer_name: String,
+    /// Остальные окна (`windows.rs`).
+    pub windows: crate::windows::Windows,
+    /// Вкладка с новым кадром, ещё не нарисованным (`paint_pending`).
+    pub frame_wanted: Option<WebView>,
 }
 
 /// Что показывает вкладка вместо адреса, ушедшего в загрузки (пока не
@@ -700,9 +1030,16 @@ impl Shell {
         self.tabs.get(self.active).map(|t| &t.webview)
     }
 
+    pub fn pointer_left_page(&mut self) {
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            tab.status = None;
+            tab.webview.notify_input_event(servo::InputEvent::MouseLeftViewport(Default::default()));
+        }
+    }
+
     pub fn toast(&mut self, text: impl Into<String>) {
         let text = text.into();
-        println!("browser: toast {text}");
+        println!("browser: toast {}", crate::logs::scrub(&text));
         self.toasts.push((text, Instant::now() + Duration::from_secs(5)));
     }
 
@@ -749,6 +1086,8 @@ impl Shell {
             accent2: look.accent2.hex(),
             chromium: window::chromium_installed(),
             notice_path: window::platform().notice_path(),
+            token: self.ui_token.clone(),
+            theme_css: crate::webui_host::theme_css(look),
         };
         if let Ok(mut shared) = self.page_data.lock() {
             if *shared == data {
@@ -768,10 +1107,11 @@ impl Shell {
 
     fn open_tab(&mut self, webview: WebView, window: &Window) {
         self.opened += 1;
-        if crate::app::MOBILE.load(std::sync::atomic::Ordering::Relaxed) {
-            webview.set_hidpi_scale_factor(euclid::Scale::new(2.0));
+        webview.set_hidpi_scale_factor(euclid::Scale::new(page_scale()));
+        let zoom = self.profile.settings.page_zoom as f32 / 100.0;
+        if zoom != 1.0 {
+            webview.set_page_zoom(zoom);
         }
-        webview.resize(page_size(self.look(), window.width(), window.height()));
         self.tabs.push(Tab {
             webview,
             title: String::from("Новая вкладка"),
@@ -779,11 +1119,13 @@ impl Shell {
             real_url: None,
             loading: true,
             status: None,
-            zoom: 1.0,
+            zoom,
             blocked: 0,
+            favicon: None,
         });
         let index = self.tabs.len() - 1;
         println!("browser: tab {} opened ({} open)", self.opened, self.tabs.len());
+        self.resize_all(window);
         self.activate(index, window);
     }
 
@@ -797,9 +1139,21 @@ impl Shell {
         self.open_tab(webview, window);
     }
 
+    /// Выйти из полного экрана, занятого страницей (другая вкладка, переход).
+    pub fn leave_page_fullscreen(&mut self) {
+        let Some(id) = self.page_fullscreen.take() else { return };
+        set_fullscreen(false);
+        if let Some(tab) = self.tabs.iter().find(|t| t.webview.id() == id) {
+            tab.webview.exit_fullscreen();
+        }
+    }
+
     pub fn activate(&mut self, index: usize, window: &Window) {
         if index >= self.tabs.len() {
             return;
+        }
+        if self.page_fullscreen.is_some_and(|id| id != self.tabs[index].webview.id()) {
+            self.leave_page_fullscreen();
         }
         for (i, tab) in self.tabs.iter().enumerate() {
             if i != index {
@@ -843,18 +1197,31 @@ impl Shell {
         self.tabs.iter().position(|t| t.webview.id() == id)
     }
 
-    pub fn resize_all(&self, window: &Window) {
+    pub fn resize_all(&mut self, window: &Window) {
         let size = page_size(self.look(), window.width(), window.height());
         // Холст swgl Servo меняет сам (`resize_rendering_context`) и, если
         // холст уже нужного размера, пропускает перестройку WebRender, —
         // поэтому трогать его здесь нельзя.
         for tab in &self.tabs {
-            tab.webview.resize(size);
+            tab.webview.set_hidpi_scale_factor(euclid::Scale::new(page_scale()));
         }
+        self.set_page_size(size);
     }
 
     pub fn load(&mut self, url: url::Url) {
-        println!("browser: go {}", url.as_str());
+        println!("browser: go {}", crate::logs::url(url.as_str()));
+        // Адрес архива или программы из строки — сразу в загрузки: иначе
+        // Servo сперва скачал бы его целиком, чтобы отказаться показывать.
+        if crate::downloads::looks_like_file(&url) {
+            self.download(url.as_str(), false);
+            return;
+        }
+        // Меню и списки прежней страницы закрываются.
+        match self.modal.take() {
+            Some(Modal::Context(menu, _)) => menu.dismiss(),
+            Some(Modal::Select(select, _)) => select.submit(),
+            other => self.modal = other,
+        }
         if let Some(tab) = self.tabs.get_mut(self.active) {
             tab.url = shown_url(&url);
             tab.loading = true;
@@ -869,14 +1236,16 @@ impl Shell {
     /// Разобрать накопленные события. Возвращает: менялась ли оболочка.
     pub fn apply_notes(&mut self, window: &Window) -> bool {
         let notes = std::mem::take(&mut *self.delegate.notes.borrow_mut());
-        let changed = !notes.is_empty();
+        // Кадр страницы оболочку не меняет: анимация на странице не должна
+        // перерисовывать egui. Несколько кадров за виток — одна отрисовка.
+        let changed = notes.iter().any(|n| !matches!(n, Note::Frame(_)));
+        // Вкладки, приславшие новый кадр (рисуется только активная).
+        let mut frames: Vec<WebViewId> = Vec::new();
         for note in notes {
             match note {
                 Note::Frame(id) => {
-                    if self.active_view().is_some_and(|w| w.id() == id) {
-                        let webview = self.tabs[self.active].webview.clone();
-                        webview.paint();
-                        self.context.present();
+                    if !frames.contains(&id) {
+                        frames.push(id);
                     }
                 }
                 Note::Title(id, title) => {
@@ -923,6 +1292,11 @@ impl Shell {
                         self.tabs[i].loading = status != LoadStatus::Complete;
                         if status == LoadStatus::Started {
                             self.tabs[i].blocked = 0;
+                            self.tabs[i].favicon = None;
+                            // Новый документ полный экран не наследует.
+                            if self.page_fullscreen == Some(id) {
+                                self.leave_page_fullscreen();
+                            }
                         }
                         if status == LoadStatus::Complete {
                             let (url, title) = (self.tabs[i].real_url.clone(), self.tabs[i].title.clone());
@@ -941,7 +1315,14 @@ impl Shell {
                     }
                 }
                 Note::History => {}
-                Note::Opened(webview) => self.open_tab(webview, window),
+                Note::Opened(webview, _) => {
+                    let back = self.active;
+                    let background = self.background_click.take().is_some_and(|at| at.elapsed() < Duration::from_secs(3));
+                    self.open_tab(webview, window);
+                    if background {
+                        self.activate(back, window);
+                    }
+                }
                 Note::Crashed(id, reason) => {
                     if let Some(i) = self.tab_index(id) {
                         let url = self.tabs[i].real_url.as_ref().map(|u| u.to_string()).unwrap_or_default();
@@ -964,9 +1345,51 @@ impl Shell {
                         self.tabs[i].blocked += 1;
                     }
                 }
+                Note::WebUi(id, payload) => self.ui_message(id, &payload, window),
+                Note::DevTools(id, payload) => {
+                    if self.active_view().is_some_and(|w| w.id() == id) && self.panel == Some(Panel::DevTools) {
+                        crate::devtools::agent_message(self, &payload);
+                    }
+                }
+                Note::Redraw => {}
+                Note::Favicon(id) => {
+                    if let Some(i) = self.tab_index(id) {
+                        let image = self.tabs[i].webview.favicon().and_then(|image| color_image(&image));
+                        self.tabs[i].favicon = image.map(Favicon::Pending);
+                    }
+                }
+                Note::Fullscreen(id, on) => {
+                    if on && self.active_view().is_some_and(|w| w.id() == id) {
+                        set_fullscreen(true);
+                        self.panel = None;
+                        self.page_fullscreen = Some(id);
+                        // Кто занял экран и как выйти — чтобы страница не
+                        // выдала себя за окно браузера.
+                        let host = self.tabs[self.active].real_url.as_ref().and_then(|u| u.host_str()).unwrap_or("Страница").to_string();
+                        self.toast(format!("{host} — на весь экран. Выход: Esc"));
+                    } else if !on && self.page_fullscreen == Some(id) {
+                        self.page_fullscreen = None;
+                        set_fullscreen(false);
+                    }
+                }
             }
         }
+        if self.active_view().is_some_and(|w| frames.contains(&w.id())) {
+            self.frame_wanted = Some(self.tabs[self.active].webview.clone());
+        }
         changed
+    }
+
+    /// Нарисовать пришедшие кадры. Painter один на все окна, поэтому — раз
+    /// за виток, после разбора событий каждого окна.
+    pub fn paint_pending(&mut self) {
+        let Some(webview) = self.frame_wanted.take() else { return };
+        let at = Instant::now();
+        webview.paint();
+        crate::perf::add(crate::perf::Stage::Paint, at);
+        let at = Instant::now();
+        self.context.present();
+        crate::perf::add(crate::perf::Stage::Store, at);
     }
 
     /// Servo показал свою «Unknown content type»: страница без заголовка.
@@ -987,24 +1410,27 @@ impl Shell {
         );
     }
 
-    fn page_offset(&self) -> egui::Vec2 {
-        let (x, y) = page_origin(self.look());
-        egui::vec2(x as f32, y as f32)
+    /// Точка страницы (физическая, как отдаёт Servo) → точка интерфейса.
+    fn ui_point(&self, x: i32, y: i32) -> egui::Pos2 {
+        let (ox, oy) = page_origin(self.look());
+        let k = ui_scale();
+        egui::pos2((x + ox as i32) as f32 / k, (y + oy as i32) as f32 / k)
     }
 
     fn show_control(&mut self, id: WebViewId, control: EmbedderControl) {
         if self.active_view().is_none_or(|w| w.id() != id) {
             return;
         }
-        let offset = self.page_offset();
         self.modal = match control {
             EmbedderControl::SelectElement(select) => {
                 let r = select.position();
-                Some(Modal::Select(select, egui::pos2(r.min.x as f32, r.max.y as f32) + offset))
+                let at = self.ui_point(r.min.x, r.max.y);
+                Some(Modal::Select(select, at))
             }
             EmbedderControl::ContextMenu(menu) => {
                 let r = menu.position();
-                Some(Modal::Context(menu, egui::pos2(r.min.x as f32, r.min.y as f32) + offset))
+                let at = self.ui_point(r.min.x, r.min.y);
+                Some(Modal::Context(menu, at))
             }
             EmbedderControl::ColorPicker(picker) => {
                 let c = picker.current_color().map(|c| [c.red, c.green, c.blue]).unwrap_or([0, 0, 0]);
@@ -1035,7 +1461,7 @@ impl Shell {
             if let Some(login) = self.profile.logins_for(&origin).into_iter().next() {
                 if !self.auth_tries.contains(&key) {
                     self.auth_tries.push(key);
-                    println!("browser: http auth from vault for {host}");
+                    println!("browser: http auth from vault for {}", crate::logs::text(&host));
                     request.authenticate(login.username, login.password);
                     return;
                 }
@@ -1065,7 +1491,7 @@ impl Shell {
                 }
                 let known = self.profile.logins_for(&origin).into_iter().any(|l| l.username == username && l.password == password);
                 if !known {
-                    println!("browser: login form submitted on {origin}");
+                    println!("browser: login form submitted on {}", crate::logs::url(&origin));
                     self.infobars.retain(|b| !matches!(b, Infobar::SaveLogin(_)));
                     self.infobars.push(Infobar::SaveLogin(Login { origin, username, password, updated_ms: now_ms() }));
                 }
@@ -1103,7 +1529,7 @@ impl Shell {
             Some("unsupported") => {
                 let what = v.str_field("what").unwrap_or("").to_string();
                 let url = self.tab_index(id).and_then(|i| self.tabs[i].real_url.as_ref().map(|u| u.to_string())).unwrap_or_default();
-                println!("browser: unsupported {what} on {url}");
+                println!("browser: unsupported {} on {}", crate::logs::text(&what), crate::logs::url(&url));
                 if !self.infobars.iter().any(|b| matches!(b, Infobar::Unsupported { .. })) {
                     self.infobars.push(Infobar::Unsupported { url, what });
                 }
@@ -1114,7 +1540,7 @@ impl Shell {
 
     pub fn fill(&mut self, id: WebViewId, login: &Login) {
         if let Some(i) = self.tab_index(id) {
-            println!("browser: autofill {}", login.origin);
+            println!("browser: autofill {}", crate::logs::url(&login.origin));
             self.tabs[i].webview.evaluate_javascript(fill_script(&login.username, &login.password), |_| {});
         }
     }
@@ -1181,14 +1607,16 @@ impl Shell {
                     self.toast("Закладка удалена");
                 } else {
                     self.profile.add_bookmark(&url, &title);
-                    println!("browser: bookmark added {url}");
+                    println!("browser: bookmark added {}", crate::logs::url(&url));
                     self.toast("Добавлено в закладки");
                 }
                 self.update_page_data();
             }
             Action::Chromium(url) => {
                 let url = if url.is_empty() { self.tabs.get(self.active).and_then(|t| t.real_url.as_ref()).map(|u| u.to_string()).unwrap_or_default() } else { url };
-                if !window::chromium_installed() {
+                if !url.starts_with("http://") && !url.starts_with("https://") {
+                    self.toast("Во внешнем браузере открываются только веб-страницы");
+                } else if !window::chromium_installed() {
                     self.toast("Chromium не установлен — поставьте пакет chromium в «Пакетах»");
                 } else {
                     match window::open_in_chromium(&url) {
@@ -1199,8 +1627,10 @@ impl Shell {
                 }
             }
             Action::Zoom(factor) => {
+                // «Сбросить» — к масштабу страниц из настроек.
+                let usual = self.profile.settings.page_zoom as f32 / 100.0;
                 if let Some(tab) = self.tabs.get_mut(self.active) {
-                    tab.zoom = if factor == 0.0 { 1.0 } else { (tab.zoom * factor).clamp(0.3, 3.0) };
+                    tab.zoom = if factor == 0.0 { usual } else { (tab.zoom * factor).clamp(0.3, 3.0) };
                     tab.webview.set_page_zoom(tab.zoom);
                 }
             }
@@ -1232,6 +1662,7 @@ impl Shell {
                     w.evaluate_javascript(pages::READER_SCRIPT, |_| {});
                 }
             }
+            Action::NewWindow => self.windows.wanted = true,
             Action::PrivateWindow => {
                 window::new_window(&["--private"]);
             }
@@ -1259,12 +1690,103 @@ impl Shell {
                 }
             }
             Action::Quit => return false,
+            Action::OpenPage(name) => {
+                self.panel = None;
+                let address = format!("obsos://{name}");
+                let open = self.tabs.iter().position(|t| t.real_url.as_ref().is_some_and(|u| u.scheme() == "obsos" && u.host_str() == Some(name)));
+                match (open, url::Url::parse(&address)) {
+                    (Some(i), _) => self.activate(i, window),
+                    (None, Ok(url)) => {
+                        // Пустую «новую вкладку» занять, а не плодить вкладки.
+                        let blank = self.tabs.get(self.active).is_some_and(|t| t.url.is_empty());
+                        if blank {
+                            self.load(url);
+                        } else {
+                            self.new_tab(url, window);
+                        }
+                    }
+                    _ => {}
+                }
+                self.focus_address = false;
+            }
+            Action::OpenBackground(text) => {
+                if let Some(url) = self.url_from_input(&text) {
+                    let back = self.active;
+                    self.new_tab(url, window);
+                    self.activate(back, window);
+                }
+            }
+            Action::Duplicate(i) => {
+                if let Some(url) = self.tabs.get(i).and_then(|t| t.real_url.clone()) {
+                    self.new_tab(url, window);
+                }
+            }
+            Action::CloseOthers(keep) => {
+                if keep < self.tabs.len() {
+                    for i in (0..self.tabs.len()).rev() {
+                        if i != keep {
+                            let tab = self.tabs.remove(i);
+                            self.closed.extend(tab.real_url.map(|u| u.to_string()));
+                        }
+                    }
+                    println!("browser: other tabs closed");
+                    self.activate(0, window);
+                }
+            }
+            Action::ReloadTab(i) => {
+                if let Some(tab) = self.tabs.get(i) {
+                    tab.webview.reload();
+                }
+            }
+            Action::MoveTab(from, to) => {
+                if from < self.tabs.len() && to < self.tabs.len() && from != to {
+                    let id = self.tabs[self.active].webview.id();
+                    let tab = self.tabs.remove(from);
+                    self.tabs.insert(to, tab);
+                    self.active = self.tab_index(id).unwrap_or(0);
+                }
+            }
+            Action::SetTabs(at) => {
+                self.profile.settings.look.tabs = at;
+                self.profile.save_settings();
+                println!("browser: tabs {}", at.id());
+            }
+            Action::Fullscreen => {
+                if self.page_fullscreen.is_some() {
+                    self.leave_page_fullscreen();
+                } else {
+                    set_fullscreen(!fullscreen());
+                    if fullscreen() {
+                        self.panel = None;
+                        self.toast("Полный экран — выход: Esc или F11");
+                    }
+                }
+            }
+            Action::Inspect => {
+                self.panel = Some(Panel::DevTools);
+                self.dev.pick = true;
+            }
+            Action::InspectAt(x, y) => {
+                self.panel = Some(Panel::DevTools);
+                // Точка интерфейса → CSS-пиксели страницы.
+                let (ox, oy) = page_origin(self.look());
+                let zoom = self.tabs.get(self.active).map(|t| t.zoom).unwrap_or(1.0);
+                let k = ui_scale();
+                let css = page_scale() * zoom;
+                crate::devtools::inspect_at(self, (x * k - ox as f32) / css, (y * k - oy as f32) / css);
+            }
+            Action::Console => {
+                self.panel = Some(Panel::DevTools);
+                self.dev.tab = crate::devtools::DevTab::Console;
+                self.dev.focus_input = true;
+            }
+            Action::Toast(text) => self.toast(text),
         }
         true
     }
 
     /// Куки Servo для адреса (`Cookie:` загрузки — файлы за входом на сайт).
-    fn cookie_for(&self, url: &url::Url) -> Option<String> {
+    pub fn cookie_for(&self, url: &url::Url) -> Option<String> {
         let cookies = self.servo.site_data_manager().cookies_for_url(url.clone(), servo::CookieSource::HTTP);
         let text = cookies.iter().map(|c| format!("{}={}", c.name(), c.value())).collect::<Vec<_>>().join("; ");
         (!text.is_empty()).then_some(text)
@@ -1330,7 +1852,7 @@ impl Shell {
             }
             let (id, webview, load, _, url) = self.dl.probes.remove(i);
             if decided == Some(true) {
-                println!("browser: document {} is a download", url.as_str());
+                println!("browser: document {} is a download", crate::logs::url(url.as_str()));
                 // Отменённый документ (`cancel`) оставлял навигацию Servo
                 // висеть — следующие переходы вкладки не шли вовсе (20.11).
                 // Поэтому ответ — короткая страница «файл скачивается», а
@@ -1345,7 +1867,7 @@ impl Shell {
                 changed = true;
             } else {
                 if late {
-                    println!("browser: probe {} too slow — page", url.as_str());
+                    println!("browser: probe {} too slow — page", crate::logs::url(url.as_str()));
                     downloads.drop_probe(id);
                 }
                 drop(load);
@@ -1357,7 +1879,10 @@ impl Shell {
                 crate::downloads::Event::Ask { id, name } => self.dl.queue.push((id, name)),
                 crate::downloads::Event::Finished { name, ok } => {
                     if ok {
-                        self.toast(format!("Загружено: {name}"));
+                        // Открытый список загрузок говорит о том же сам.
+                        if self.panel != Some(Panel::Downloads) && !self.chrome.popup_due() {
+                            self.toast(format!("Загружено: {name}"));
+                        }
                     }
                     changed = true;
                 }
@@ -1386,7 +1911,7 @@ impl Shell {
                 };
                 match purpose {
                     DialogFor::Save(id) => {
-                        println!("browser: save as {}", chosen.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| String::from("cancelled")));
+                        println!("browser: save as {}", crate::logs::text(&chosen.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| String::from("cancelled"))));
                         downloads.answer(id, chosen);
                     }
                     DialogFor::Folder => {
@@ -1654,8 +2179,10 @@ impl Shell {
         }
     }
 
+    /// Адреса вкладок всех окон, начиная с текущего (сеанс восстанавливается
+    /// в одно окно).
     pub fn session_urls(&self) -> Vec<String> {
-        self.tabs.iter().filter_map(|t| t.real_url.as_ref().map(|u| u.to_string())).filter(|u| !u.starts_with("data:")).collect()
+        self.all_tabs().filter_map(|t| t.real_url.as_ref().map(|u| u.to_string())).filter(|u| !u.starts_with("data:")).collect()
     }
 }
 

@@ -9,6 +9,17 @@
 разрабатывать и отлаживать прямо на Windows (и Linux), а в FossAi подключать
 готовым.
 
+**Скачать для Windows** — [последний выпуск](https://github.com/anomal3/OBSOS/releases/latest):
+распаковать архив и запустить `obsos.exe` (Windows 10/11 x64, установка не
+нужна). Это ранняя версия: движок Servo молодой, часть сайтов выглядит или
+работает не так, как в Chrome и Firefox.
+
+| | |
+|---|---|
+| ![Новая вкладка](docs/screenshots/newtab.png) | ![Страница](docs/screenshots/page.png) |
+| ![Настройки](docs/screenshots/settings.png) | ![Загрузки](docs/screenshots/downloads.png) |
+| ![Инструменты разработчика](docs/screenshots/devtools.png) | ![Вкладки сбоку, светлая тема](docs/screenshots/vertical-light.png) |
+
 ## Как устроено
 
 ```
@@ -28,10 +39,38 @@ assets/icons/    значок OBSOS
 docs/NOTICE.md   лицензии (страница obsos://licenses)
 ```
 
-Рисует OBSOS везде одинаково и **программно**: страницу — swgl (программный
-OpenGL из Firefox, «Software WebRender»), оболочку — egui прямо в пиксели. От
-платформы нужны только поверхность окна и события (в кодировке окна FossAi,
-`WinEvent`) — поэтому то, что видно на Windows, то же самое, что на FossAi.
+На Windows всё окно рисует **видеокарта** (`obsos-core/src/gpu_ctx.rs`):
+страницы всех окон — в один общий буфер (surfman/WGL), у каждого окна свой
+участок (`windows.rs`), оболочка egui — через `egui_glow`, показ по частоте
+экрана. На FossAi и с ключом `--swgl`
+всё рисует процессор (swgl и egui прямо в пиксели). От платформы нужны
+поверхность окна и события (в кодировке окна FossAi, `WinEvent`), для
+видеокарты — ещё дескрипторы окна (`HostWindow::gl_handles`).
+
+## Что умеет оболочка
+
+* Вкладки сверху (по умолчанию; на FossAi — слева), слева, справа или снизу
+  (настройки, меню «⋮», правая кнопка на вкладке); перетаскивание, значки
+  сайтов, меню вкладки.
+* Несколько окон (Ctrl+N, с видеокартой): вкладку можно вытянуть мышью в своё
+  окно и вернуть в полосу другого — страница при этом не перезагружается.
+* Адресная строка с подсказками из истории и закладок.
+* Страницы `obsos://settings`, `obsos://history`, `obsos://bookmarks`,
+  `obsos://downloads` (`webui.rs`, команды — только от них самих,
+  `webui_host.rs`).
+* Инструменты разработчика (F12; справа или снизу): элементы со стилями и
+  блочной моделью, выбор элемента (Ctrl+Shift+C), консоль, сеть, исходники,
+  хранилище (куки, local/sessionStorage), скорость загрузки. Отладчик с
+  точками останова — Firefox: `obsos --devtools`, затем в Firefox
+  `about:debugging` → `localhost:6080`.
+* Масштаб интерфейса (как у системы или свой) и страниц, плавная прокрутка,
+  полный экран (F11), Ctrl+колесо, боковые кнопки мыши.
+
+### Обходы пробелов движка
+
+Скрипт страниц (`shell::PAGE_SCRIPT`) дорисовывает то, чего Servo не умеет:
+`fill="var(--…)"` в SVG (иначе чёрные прямоугольники) и «градиентный текст»
+(`background-clip: text` — буквы красятся первым цветом градиента).
 
 История файлов перенесена из репозитория FossAi (`git filter-repo`): `git log
 --follow obsos-core/src/shell.rs` показывает и прежние коммиты.
@@ -48,21 +87,49 @@ OpenGL из Firefox, «Software WebRender»), оболочку — egui прям
 SpiderMonkey (`mozjs_sys`) на Windows не собирается из исходников — его
 build.rs скачивает готовую библиотеку с github.com/servo/mozjs.
 
+Одной командой (с видео, если есть GStreamer):
+
+```bat
+powershell -ExecutionPolicy Bypass -File tools\build-windows.ps1
+target\release\obsos.exe https://servo.org
+```
+
+Или вручную, без видео:
+
 ```bat
 cargo xtask vendor
 set CC=clang-cl
 set CXX=clang-cl
 set PYTHON3=C:\Python314\python.exe
 cargo build --release
-target\release\obsos.exe https://web.pynop.online
 ```
 
-Первая сборка — около 40 минут и ~15 ГБ в `target\` (release; отладочная
-сборка Servo заняла бы ещё столько же). Дальше пересобирается только OBSOS.
-Консоль остаётся открытой — в ней журнал `browser: …` (страницы, сеть, ошибки
-скриптов страниц).
+Архив для выпуска (только нужные DLL, без GPL-библиотек GStreamer):
+`tools\build-windows.ps1 -Dist`, затем `tools\package-windows.ps1` → `dist\`.
 
-Ключи: `obsos [--profile <имя>] [--private] [--sync-folder <папка>] [адрес]`.
+Первая сборка — от 6 до 40 минут и ~15 ГБ в `target\` (release; отладочная
+сборка Servo заняла бы ещё столько же). Дальше пересобирается только OBSOS.
+Окна консоли рядом с браузером нет: журнал `browser: …` (страницы, сеть,
+ошибки скриптов страниц) пишется в `%USERPROFILE%\.config\obsos\obsos.log`
+(прошлый запуск — `obsos.old.log`); `--console` открывает консоль, а
+перенаправление (`obsos > журнал.txt`) работает как обычно.
+
+**Видео и звук** — фича `video` (`cargo build --release --features video`):
+нужен GStreamer 1.26 MSVC x86_64 (runtime и devel с gstreamer.freedesktop.org;
+можно только распаковать: `msiexec /a <msi> /qn TARGETDIR=<папка>`; у devel
+распаковка спотыкается на шаблонах Visual Studio — их можно убрать из копии
+пакета) и его DLL с плагинами рядом с `obsos.exe` (это делает скрипт).
+Потоковое видео (YouTube: Media Source Extensions) Servo не умеет и с ним.
+
+Ключи: `obsos [--profile <имя>] [--private] [--sync-folder <папка>]
+[--size ШxВ] [--swgl] [--devtools [порт]] [--pref имя=значение] [адрес]`.
+
+### Проверка без человека
+
+`obsos --control <файл>` выполняет команды, дописываемые в файл: переход,
+щелчки, клавиши, набор, `eval`, снимок окна в BMP, замеры времени кадра
+(список — в `obsos-core/src/automation.rs`). Так проверяются изменения
+интерфейса и скорости.
 
 Данные: `%USERPROFILE%\.config\obsos\<профиль>` (настройки, закладки, история,
 пароли), `%USERPROFILE%\.config\servo` (куки, localStorage, IndexedDB),
@@ -93,11 +160,13 @@ docker run --rm -v <FossAi>:/work -v <OBSOS>:/obsos -v fossai-servo:/cache \
 
 ## Что ещё не так, как на FossAi
 
-* Масштаб экрана (HiDPI) не учитывается: оболочка и страница — в точках
-  экрана, на 150 % мелко. Нужен масштаб от окна в `obsos-core`.
-* Рисование программное (как на FossAi): на больших окнах медленнее
-  настоящих браузеров. GPU-путь Servo (surfman/ANGLE) — отдельная работа.
+* Масштаб экрана учитывается на Windows/Linux; на FossAi окно сообщает 1.
+* Видеокарта — только на Windows; на Linux и FossAi рисует процессор.
 * «Открыть в Chromium» на Windows/Linux открывает браузер системы по умолчанию.
+* Пробелы Servo 0.8: нет Media Source Extensions (YouTube), WebGL, CSS-масок
+  (часть значков — чёрными квадратами, например в Википедии).
+* Без фичи `video` (и на FossAi) `<video>` никогда не сообщает о загрузке:
+  событие `load` не наступает, а некоторые страницы (github.com) падают.
 
 ## Лицензия
 

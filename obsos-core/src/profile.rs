@@ -42,6 +42,47 @@ impl Rgb {
     }
 }
 
+/// Положение вкладок.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TabsAt {
+    #[default]
+    Left,
+    Top,
+    Right,
+    Bottom,
+}
+
+impl TabsAt {
+    pub const ALL: [TabsAt; 4] = [TabsAt::Left, TabsAt::Top, TabsAt::Right, TabsAt::Bottom];
+
+    pub fn id(self) -> &'static str {
+        match self {
+            TabsAt::Left => "left",
+            TabsAt::Top => "top",
+            TabsAt::Right => "right",
+            TabsAt::Bottom => "bottom",
+        }
+    }
+
+    pub fn title(self) -> &'static str {
+        match self {
+            TabsAt::Left => "Слева",
+            TabsAt::Top => "Сверху",
+            TabsAt::Right => "Справа",
+            TabsAt::Bottom => "Снизу",
+        }
+    }
+
+    pub fn from_id(id: &str) -> Option<TabsAt> {
+        TabsAt::ALL.into_iter().find(|t| t.id() == id)
+    }
+
+    /// Боковая панель (а не горизонтальная полоса).
+    pub fn is_side(self) -> bool {
+        matches!(self, TabsAt::Left | TabsAt::Right)
+    }
+}
+
 /// Оформление: палитра целиком задаётся пользователем (у Zervo цвета тем —
 /// константы), сохраняется под своим именем и синхронизируется.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -53,8 +94,8 @@ pub struct Look {
     pub sidebar: Rgb,
     pub toolbar: Rgb,
     pub text: Rgb,
-    /// Вкладки: слева (`true`) или полосой сверху.
-    pub side_tabs: bool,
+    /// Где вкладки: боковой панелью слева/справа или полосой сверху/снизу.
+    pub tabs: TabsAt,
     /// Ширина боковой панели (точки).
     pub sidebar_width: u32,
     /// Насколько далеко акцент заходит в оболочку: 0 — только выделение,
@@ -63,17 +104,21 @@ pub struct Look {
     pub compact: bool,
 }
 
+/// Где вкладки у нового профиля: сверху; на FossAi — слева (на геометрию
+/// боковой панели целится стенд).
+const DEFAULT_TABS: TabsAt = if cfg!(target_os = "freeos") { TabsAt::Left } else { TabsAt::Top };
+
 impl Look {
     pub fn dark() -> Look {
         Look {
             name: String::from("Тёмное"),
             dark: true,
-            accent: Rgb(0x7a, 0x4f, 0xd8),
-            accent2: Rgb(0x2b, 0xb3, 0xb1),
-            sidebar: Rgb(0x17, 0x1a, 0x2e),
-            toolbar: Rgb(0x20, 0x24, 0x3c),
-            text: Rgb(0xe8, 0xec, 0xf8),
-            side_tabs: true,
+            accent: Rgb(0x3b, 0x78, 0xd8),
+            accent2: Rgb(0x6a, 0xa6, 0xf8),
+            sidebar: Rgb(0x1c, 0x1d, 0x20),
+            toolbar: Rgb(0x29, 0x2a, 0x2e),
+            text: Rgb(0xe6, 0xe7, 0xe9),
+            tabs: DEFAULT_TABS,
             sidebar_width: 216,
             accent_reach: 1,
             compact: false,
@@ -84,12 +129,12 @@ impl Look {
         Look {
             name: String::from("Светлое"),
             dark: false,
-            accent: Rgb(0x5b, 0x3c, 0xc4),
-            accent2: Rgb(0x13, 0x8f, 0x8d),
-            sidebar: Rgb(0xec, 0xee, 0xf6),
-            toolbar: Rgb(0xf7, 0xf8, 0xfc),
-            text: Rgb(0x1d, 0x24, 0x33),
-            side_tabs: true,
+            accent: Rgb(0x1f, 0x63, 0xc8),
+            accent2: Rgb(0x18, 0x56, 0xb0),
+            sidebar: Rgb(0xdf, 0xe1, 0xe5),
+            toolbar: Rgb(0xf5, 0xf6, 0xf7),
+            text: Rgb(0x1d, 0x1f, 0x23),
+            tabs: DEFAULT_TABS,
             sidebar_width: 216,
             accent_reach: 1,
             compact: false,
@@ -106,7 +151,9 @@ impl Look {
             ("sidebar".into(), s(self.sidebar.hex())),
             ("toolbar".into(), s(self.toolbar.hex())),
             ("text".into(), s(self.text.hex())),
-            ("side_tabs".into(), Value::Bool(self.side_tabs)),
+            // `side_tabs` — для устройств со старой версией OBSOS.
+            ("side_tabs".into(), Value::Bool(self.tabs.is_side())),
+            ("tabs".into(), s(self.tabs.id().to_string())),
             ("sidebar_width".into(), Value::Num(self.sidebar_width.to_string())),
             ("accent_reach".into(), Value::Num(self.accent_reach.to_string())),
             ("compact".into(), Value::Bool(self.compact)),
@@ -120,7 +167,7 @@ impl Look {
             Some(Value::Num(n)) => n.parse::<u32>().ok(),
             _ => None,
         };
-        Some(Look {
+        let look = Look {
             name: v.str_field("name")?.to_string(),
             dark: base.dark,
             accent: color("accent", base.accent),
@@ -128,11 +175,28 @@ impl Look {
             sidebar: color("sidebar", base.sidebar),
             toolbar: color("toolbar", base.toolbar),
             text: color("text", base.text),
-            side_tabs: v.get("side_tabs") != Some(&Value::Bool(false)),
+            tabs: v.str_field("tabs").and_then(TabsAt::from_id).unwrap_or(match v.get("side_tabs") {
+                Some(Value::Bool(true)) => TabsAt::Left,
+                Some(Value::Bool(false)) => TabsAt::Top,
+                _ => DEFAULT_TABS,
+            }),
             sidebar_width: num("sidebar_width").unwrap_or(216).clamp(160, 420),
             accent_reach: num("accent_reach").unwrap_or(1).min(2) as u8,
             compact: v.get("compact") == Some(&Value::Bool(true)),
-        })
+        };
+        Some(look.updated())
+    }
+
+    /// Прежние цвета встроенных тем (фиолетовые) заменяются нынешними;
+    /// темы с любой правкой цвета не трогаются.
+    fn updated(self) -> Look {
+        let colors = |l: &Look| [l.accent, l.accent2, l.sidebar, l.toolbar, l.text].map(|c| c.hex()).join(" ");
+        let now = match colors(&self).as_str() {
+            "#7a4fd8 #2bb3b1 #171a2e #20243c #e8ecf8" => Look::dark(),
+            "#5b3cc4 #138f8d #eceef6 #f7f8fc #1d2433" => Look::light(),
+            _ => return self,
+        };
+        Look { accent: now.accent, accent2: now.accent2, sidebar: now.sidebar, toolbar: now.toolbar, text: now.text, ..self }
     }
 }
 
@@ -209,6 +273,15 @@ pub struct Settings {
     pub download_dir: String,
     /// Спрашивать, куда сохранять каждый файл (окно «Сохранить как»).
     pub download_ask: bool,
+    /// Масштаб оболочки в процентах; 0 — как у экрана системы.
+    pub ui_scale: u32,
+    /// Масштаб страниц в процентах.
+    pub page_zoom: u32,
+    /// Плавная прокрутка колесом.
+    pub smooth_scroll: bool,
+    /// Рисовать страницы видеокартой (где платформа это умеет); с
+    /// перезапуска.
+    pub gpu: bool,
 }
 
 impl Settings {
@@ -235,6 +308,10 @@ impl Settings {
             history_days: 90,
             download_dir: String::new(),
             download_ask: false,
+            ui_scale: 0,
+            page_zoom: 100,
+            smooth_scroll: true,
+            gpu: true,
         }
     }
 
@@ -256,6 +333,10 @@ impl Settings {
             ("history_days".into(), Value::Num(self.history_days.to_string())),
             ("download_dir".into(), Value::Str(self.download_dir.clone())),
             ("download_ask".into(), Value::Bool(self.download_ask)),
+            ("ui_scale".into(), Value::Num(self.ui_scale.to_string())),
+            ("page_zoom".into(), Value::Num(self.page_zoom.to_string())),
+            ("smooth_scroll".into(), Value::Bool(self.smooth_scroll)),
+            ("gpu".into(), Value::Bool(self.gpu)),
         ])
         .to_text()
     }
@@ -300,6 +381,13 @@ impl Settings {
             s.download_dir = dir.to_string();
         }
         s.download_ask = flag("download_ask", s.download_ask);
+        s.ui_scale = match num("ui_scale", s.ui_scale) {
+            0 => 0,
+            n => n.clamp(75, 300),
+        };
+        s.page_zoom = num("page_zoom", s.page_zoom).clamp(30, 300);
+        s.smooth_scroll = flag("smooth_scroll", s.smooth_scroll);
+        s.gpu = flag("gpu", s.gpu);
         Some(s)
     }
 }

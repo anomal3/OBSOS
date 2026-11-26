@@ -35,6 +35,9 @@ pub struct PageData {
     pub accent2: String,
     pub chromium: bool,
     pub notice_path: String,
+    /// Ключ команд страниц управления и цвета оболочки для них (`webui.rs`).
+    pub token: String,
+    pub theme_css: String,
 }
 
 pub type Shared = Arc<Mutex<PageData>>;
@@ -68,24 +71,24 @@ fn enc(text: &str) -> String {
 
 fn style(d: &PageData) -> String {
     let (bg, fg, card, border, dim) = if d.dark {
-        ("linear-gradient(160deg,#1b1f3a,#2a1f4a 55%,#123a44)", "#e8ecf8", "rgba(255,255,255,.07)", "rgba(255,255,255,.13)", ".72")
+        ("#1c1d20", "#e6e7e9", "#292a2e", "#414247", ".66")
     } else {
-        ("linear-gradient(160deg,#f4f6fb,#efeafb 55%,#e6f5f4)", "#1d2433", "rgba(255,255,255,.75)", "rgba(29,36,51,.12)", ".68")
+        ("#f5f6f7", "#1d1f23", "#ffffff", "#d5d7dc", ".66")
     };
     format!(
         "body{{margin:0;font-family:sans-serif;background:{bg};color:{fg};min-height:100vh}}\
 .wrap{{max-width:760px;margin:0 auto;padding:48px 28px 40px}}\
 h1{{margin:0;font-size:42px;letter-spacing:2px}} h2{{margin:28px 0 10px;font-size:22px}}\
 .sub{{margin:6px 0 24px;opacity:{dim};font-size:15px}}\
-.card{{padding:16px 20px;border-radius:12px;background:{card};border:1px solid {border};line-height:1.55;margin:0 0 14px}}\
+.card{{padding:16px 20px;border-radius:6px;background:{card};border:1px solid {border};line-height:1.55;margin:0 0 14px}}\
 a{{color:{a2}}} code,pre{{font-family:monospace;background:rgba(127,127,127,.15);border-radius:6px}} code{{padding:1px 5px}} pre{{padding:12px;overflow:auto}}\
 form{{display:flex;margin:0 0 28px}}\
-input{{flex:1;font-size:17px;padding:12px 16px;border-radius:10px 0 0 10px;border:1px solid {border};background:{card};color:{fg}}}\
-button,.btn{{font-size:16px;padding:11px 20px;border:0;border-radius:10px;background:linear-gradient(90deg,{a1},{a2});color:#fff;text-decoration:none;display:inline-block;margin:6px 10px 0 0}}\
-form button{{border-radius:0 10px 10px 0;margin:0}}\
+input{{flex:1;font-size:16px;padding:10px 14px;border-radius:4px 0 0 4px;border:1px solid {border};background:{card};color:{fg}}}\
+button,.btn{{font-size:15px;padding:10px 18px;border:0;border-radius:4px;background:{a1};color:#fff;text-decoration:none;display:inline-block;margin:6px 10px 0 0}}\
+form button{{border-radius:0 4px 4px 0;margin:0}}\
 .btn.plain{{background:{card};color:{fg};border:1px solid {border}}}\
 .tiles{{display:flex;flex-wrap:wrap}}\
-.tiles a{{display:block;width:150px;margin:0 14px 14px 0;padding:14px;border-radius:12px;background:{card};border:1px solid {border};color:{fg};text-decoration:none;overflow:hidden}}\
+.tiles a{{display:block;width:150px;margin:0 14px 14px 0;padding:14px;border-radius:6px;background:{card};border:1px solid {border};color:{fg};text-decoration:none;overflow:hidden}}\
 .tiles b{{display:block;font-size:17px;margin-bottom:6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}\
 .tiles span{{font-size:12px;opacity:.7;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:block}}\
 .small{{font-size:13px;opacity:{dim}}} li{{margin:4px 0}}",
@@ -103,9 +106,10 @@ fn page(d: &PageData, title: &str, body: &str) -> String {
 }
 
 const LIMITS: &str = "<ul>\
-<li><b>Потоковое видео</b> (YouTube и подобные) не работает: им нужны Media Source Extensions, которых в Servo нет. \
+<li><b>Потоковое видео</b> (YouTube и подобные) не работает: им нужны Media Source Extensions, которых в Servo нет \
+(обычные ролики и звук играют в сборке Windows с GStreamer). \
 OBSOS говорит об этом прямо на такой странице и предлагает открыть её в Chromium.</li>\
-<li><b>WebGL и аппаратное ускорение</b> — нет: страницу рисует процессор (swgl). Нужен <code>dlopen</code> и Mesa — это в планах ОС.</li>\
+<li><b>WebGL</b> — нет. Страницы на Windows рисует видеокарта (отключается в настройках), на FossAi — процессор (swgl).</li>\
 <li><b>Расширения</b> — движок их не поддерживает; вместо них — пользовательские скрипты и стили \
 (<code>~/.config/obsos/&lt;профиль&gt;/userscripts/*.js</code>, <code>*.css</code>).</li>\
 <li><b>Подстановка паролей</b> работает через скрипт в странице (перехват отправки формы и заполнение полей) и для HTTP-входа; \
@@ -134,14 +138,13 @@ fn newtab(d: &PageData) -> String {
     }
     tiles.push_str("<a href=\"obsos://about\"><b>О программе</b><span>obsos://about</span></a>");
     let body = format!(
-        "<h1>OBSOS</h1><p class=\"sub\">Open Browser for System Open Source — браузер FreeOS</p>\
+        "<h1>OBSOS</h1><p class=\"sub\">Open Browser for System Open Source</p>\
 <p id=\"hello\" style=\"font-size:20px;margin:0 0 18px\">Привет!</p>\
 <form action=\"{action}\" method=\"get\"><input name=\"{field}\" placeholder=\"Поиск: {engine}\" autofocus><button>Найти</button></form>\
 <div class=\"tiles\">{tiles}</div>\
-<p class=\"small\">Движок Servo — © The Servo Project Developers (MPL-2.0). Оболочка — своя, на egui; дизайн по мотивам Zervo — © Goddv \
-(MPL-2.0). <a href=\"obsos://licenses\">Лицензии</a> · <a href=\"obsos://about\">О программе</a></p>\
+<p class=\"small\"><a href=\"obsos://about\">О программе</a> · <a href=\"obsos://licenses\">Лицензии</a></p>\
 <script>var h=new Date().getHours();document.getElementById('hello').textContent=\
-(h<5?'Доброй ночи':h<12?'Доброе утро':h<18?'Добрый день':'Добрый вечер')+' — JavaScript работает.';</script>",
+(h<5?'Доброй ночи':h<12?'Доброе утро':h<18?'Добрый день':'Добрый вечер')+'!';</script>",
         action = escape(&d.search_action),
         field = escape(&d.search_field),
         engine = escape(&d.search_title),
@@ -153,8 +156,8 @@ fn about(d: &PageData) -> String {
     let body = format!(
         "<h1>OBSOS</h1><p class=\"sub\">Open Browser for System Open Source · версия {}</p>\
 <div class=\"card\"><b>Движок</b> — Servo {} (© The Servo Project Developers, <a href=\"https://servo.org\">servo.org</a>, MPL-2.0); \
-JavaScript — SpiderMonkey, рисование — swgl/WebRender на процессоре (© Mozilla, MPL-2.0).<br>\
-<b>Оболочка</b> — своя, на egui (MIT/Apache-2.0); дизайн по мотивам Zervo — © Goddv, \
+JavaScript — SpiderMonkey, рисование — WebRender: видеокартой или swgl на процессоре (© Mozilla, MPL-2.0).<br>\
+<b>Дизайн</b> — по мотивам Zervo, © Goddv, \
 <a href=\"https://github.com/Goddv/Zervo\">github.com/Goddv/Zervo</a> (MPL-2.0).<br>\
 Текст MPL-2.0 — <a href=\"https://mozilla.org/MPL/2.0/\">mozilla.org/MPL/2.0</a>; все компоненты — <a href=\"obsos://licenses\">лицензии</a>.</div>\
 <h2>Синхронизация</h2><div class=\"card\">Закладки, история, оформление и пароли — в ваш репозиторий GitHub, GitLab или Bitbucket \
@@ -438,6 +441,7 @@ pub fn render(d: &PageData, url: &url::Url) -> (u16, String) {
     match url.host_str().unwrap_or("") {
         "newtab" | "" => (200, newtab(d)),
         "about" => (200, about(d)),
+        host @ ("settings" | "history" | "bookmarks" | "downloads") => (200, crate::webui::render(host, &d.token, &d.theme_css).unwrap_or_default()),
         "licenses" => view_file(d, &d.notice_path),
         "view" => view_file(d, &query(url, "path")),
         "crashed" => (200, crashed(d, &query(url, "url"), &query(url, "reason"))),

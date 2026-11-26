@@ -10,11 +10,25 @@ publish = false
 name = "obsos"
 path = "src/main.rs"
 
+[features]
+# Видео и звук (`<video>`, `<audio>`) через GStreamer — нужен его SDK при
+# сборке и DLL рядом с программой (README).
+video = ["servo/media-gstreamer"]
+
 [dependencies]
 obsos-core = { path = "../obsos-core" }
+# Возможности Servo только настольной сборки (на FossAi их не собираем):
+# `crypto.subtle` и сервер инструментов разработчика (Firefox).
+servo = { workspace = true, features = ["subtlecrypto", "devtools"] }
+# Выбор дискретной видеокарты на ПК с двумя (`declare_surfman!`).
+surfman.workspace = true
 winit = "0.30"
 softbuffer = "0.4"
 arboard = { version = "3", default-features = false }
+# Значок окна из assets/icons.
+png = "0.18"
+# Смещение местного времени для дат в истории.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # Окна выбора файла: на Windows — системные (COM), на Linux — портал xdg
 # (без GTK при сборке).
 rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }

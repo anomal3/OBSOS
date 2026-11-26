@@ -60,6 +60,18 @@ impl Platform for Desktop {
         self.clipboard.lock().ok()?.as_mut()?.get_text().ok()
     }
 
+    fn ui_font(&self) -> Option<Vec<u8>> {
+        if !cfg!(windows) {
+            return None;
+        }
+        let windows = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
+        std::fs::read(Path::new(&windows).join("Fonts").join("segoeui.ttf")).ok()
+    }
+
+    fn utc_offset_minutes(&self) -> i32 {
+        chrono::Local::now().offset().local_minus_utc() / 60
+    }
+
     fn new_window(&self, args: &[&str]) -> Result<(), String> {
         let exe = std::env::current_exe().map_err(|e| e.to_string())?;
         run_detached(Command::new(exe).args(args)).map(|_| ())
@@ -86,8 +98,10 @@ impl Platform for Desktop {
     }
 
     fn open_in_chromium(&self, url: &str) -> Result<i64, String> {
-        if url.is_empty() {
-            return Err(String::from("нет адреса"));
+        // Только веб: `rundll32 …FileProtocolHandler` по `file:` запустил бы
+        // программу.
+        if !url.starts_with("http://") && !url.starts_with("https://") {
+            return Err(String::from("только веб-адреса"));
         }
         if cfg!(windows) {
             // Без cmd: знаки `&` в адресе не разбираются как команды.

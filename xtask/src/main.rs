@@ -58,6 +58,44 @@ const SCRIPT_EDITS: &[Edit] = &[
         new: "            // __obsos__: без потоковой компиляции wasm (patches/README.md).\n            let _ = (consume_stream, report_stream_error);",
         count: 1,
     },
+    // `<style>`, добавленный в shadow root после элементов, не действовал:
+    // набор стилей помечался изменённым, но никто не просил его пересчитать
+    // (плеер vkvideo.ru и другие веб-компоненты — без оформления,
+    // 26.11.2026). Везде.
+    Edit {
+        file: "dom/shadowroot/shadowroot.rs",
+        old: "        let stylesheets = &mut self.author_styles.borrow_mut().stylesheets;\n\n        // FIXME(stevennovaryo)",
+        new: "        // __obsos__: заём отпускается до пометки (patches/README.md).\n        let mut styles = self.author_styles.borrow_mut();\n        let stylesheets = &mut styles.stylesheets;\n\n        // FIXME(stevennovaryo)",
+        count: 1,
+    },
+    Edit {
+        file: "dom/shadowroot/shadowroot.rs",
+        old: "        DocumentOrShadowRoot::add_stylesheet(\n            StylesheetSource::Element(Dom::from_ref(owner_node)),\n            StylesheetSetRef::Author(stylesheets),\n            sheet,\n            insertion_point,\n            self.document.style_shared_author_lock(),\n        );\n",
+        new: "        DocumentOrShadowRoot::add_stylesheet(\n            StylesheetSource::Element(Dom::from_ref(owner_node)),\n            StylesheetSetRef::Author(stylesheets),\n            sheet,\n            insertion_point,\n            self.document.style_shared_author_lock(),\n        );\n        // __obsos__: пересчитать стили shadow root.\n        drop(styles);\n        self.invalidate_stylesheets(no_gc);\n",
+        count: 1,
+    },
+    // IndexedDB: завершение транзакции могло встать в очередь дважды (отказ и
+    // запроса, и фиксации), второе роняло браузер паникой
+    // «clear_upgrade_transaction called but no upgrade transaction is set»
+    // (вход в Rupor на FossAi, 26.11.2026). Везде.
+    Edit {
+        file: "dom/indexeddb/idbtransaction.rs",
+        old: "            .queue(task!(send_abort_notification: move |cx| {\n                let this = this.root();\n",
+        new: "            .queue(task!(send_abort_notification: move |cx| {\n                let this = this.root();\n                // __obsos__: уже завершена (patches/README.md).\n                if this.finished.get() {\n                    return;\n                }\n",
+        count: 1,
+    },
+    Edit {
+        file: "dom/indexeddb/idbtransaction.rs",
+        old: "            task!(send_complete_notification: move |cx| {\n                let this = this.root();\n",
+        new: "            task!(send_complete_notification: move |cx| {\n                let this = this.root();\n                // __obsos__: уже завершена (patches/README.md).\n                if this.finished.get() {\n                    return;\n                }\n",
+        count: 1,
+    },
+    Edit {
+        file: "dom/indexeddb/idbdatabase.rs",
+        old: "        let current = self\n            .upgrade_transaction\n            .get()\n            .expect(\"clear_upgrade_transaction called but no upgrade transaction is set\");\n\n        debug_assert!(\n            &*current == transaction,\n            \"clear_upgrade_transaction called with non-current transaction\"\n        );\n\n        self.upgrade_transaction.set(None);\n",
+        new: "        // __obsos__: без паники (patches/README.md).\n        if self.upgrade_transaction.get().is_some_and(|current| &*current == transaction) {\n            self.upgrade_transaction.set(None);\n        }\n",
+        count: 1,
+    },
 ];
 
 const NET_EDITS: &[Edit] = &[
@@ -73,14 +111,29 @@ const NET_EDITS: &[Edit] = &[
 ];
 
 const PAINT_EDITS: &[Edit] = &[
-    // OBSOS рисует swgl (везде, и на Windows): WebRender очищает кэш картинок
+    // Несколько окон на одном painter: буфер общий («атлас»), у каждой
+    // вкладки свой участок — его задаёт приложение. Без записи в списке
+    // вкладка, как и раньше, занимает весь буфер. Везде.
+    Edit {
+        file: "lib.rs",
+        old: "mod painter;\n",
+        new: "mod painter;\n/// __obsos__: участки общего буфера для вкладок нескольких окон\n/// (patches/README.md).\npub mod obsos {\n    use std::collections::HashMap;\n    use std::sync::Mutex;\n\n    use servo_base::id::WebViewId;\n\n    /// Вкладка → (x, y, ширина, высота) в точках буфера.\n    pub static VIEWPORTS: Mutex<Option<HashMap<WebViewId, [f32; 4]>>> = Mutex::new(None);\n}\n",
+        count: 1,
+    },
+    Edit {
+        file: "painter.rs",
+        old: "        if self.rendering_context.size() == new_size {\n            return;\n        }\n\n        if let Err(error) = self.rendering_context.make_current() {\n            error!(\"Failed to make the rendering context current: {error:?}\");\n        }\n        self.rendering_context.resize(new_size);\n\n        let new_size = Size2D::new(new_size.width as f32, new_size.height as f32);\n        let new_viewport_rect = Rect::from(new_size).to_box2d();\n        for webview_renderer in self.webview_renderers.values_mut() {\n            webview_renderer.set_rect(new_viewport_rect);\n            webview_renderer.webview.notify_viewport_updated();\n        }\n",
+        new: "        // __obsos__: у вкладки может быть свой участок буфера, и он меняется\n        // без изменения размера буфера (patches/README.md).\n        let size_changed = self.rendering_context.size() != new_size;\n        if size_changed {\n            if let Err(error) = self.rendering_context.make_current() {\n                error!(\"Failed to make the rendering context current: {error:?}\");\n            }\n            self.rendering_context.resize(new_size);\n        }\n\n        let new_size = Size2D::new(new_size.width as f32, new_size.height as f32);\n        let new_viewport_rect = Rect::from(new_size).to_box2d();\n        let mut moved = false;\n        {\n            let viewports = crate::obsos::VIEWPORTS.lock().ok();\n            for (id, webview_renderer) in self.webview_renderers.iter_mut() {\n                let rect = viewports.as_ref().and_then(|v| v.as_ref()?.get(id)).map_or(new_viewport_rect, |r| {\n                    Rect::new(Point2D::new(r[0], r[1]), Size2D::new(r[2], r[3])).to_box2d()\n                });\n                if webview_renderer.set_rect(rect) || size_changed {\n                    webview_renderer.webview.notify_viewport_updated();\n                    moved = true;\n                }\n            }\n        }\n        if !size_changed && !moved {\n            return;\n        }\n",
+        count: 1,
+    },
+    // Для swgl (программный OpenGL): WebRender очищает кэш картинок
     // «квадратами» с тестом глубины ALWAYS, а swgl умеет только LESS/LEQUAL
     // (assert в DepthFunc, gl.cc:1390 — падение на первом кадре) — очистка
-    // обычным glClear по ножницам.
+    // обычным glClear по ножницам. С видеокартой — как в самом Servo.
     Edit {
         file: "painter.rs",
         old: "                shared_font_namespace: Some(painter_id.into()),\n                ..Default::default()",
-        new: "                shared_font_namespace: Some(painter_id.into()),\n                // __obsos__: swgl не умеет DepthFunc(ALWAYS).\n                clear_caches_with_quads: false,\n                ..Default::default()",
+        new: "                shared_font_namespace: Some(painter_id.into()),\n                // __obsos__: swgl не умеет DepthFunc(ALWAYS).\n                clear_caches_with_quads: !webrender_gl.get_string(RENDERER).starts_with(\"Software WebRender\"),\n                ..Default::default()",
         count: 1,
     },
     // Варианта шейдеров DITHERING в swgl нет («unknown shader
@@ -88,7 +141,7 @@ const PAINT_EDITS: &[Edit] = &[
     Edit {
         file: "painter.rs",
         old: "                enable_dithering: true,",
-        new: "                enable_dithering: false, // __obsos__: swgl",
+        new: "                enable_dithering: !webrender_gl.get_string(RENDERER).starts_with(\"Software WebRender\"), // __obsos__: swgl",
         count: 1,
     },
 ];

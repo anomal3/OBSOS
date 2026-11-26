@@ -1,8 +1,9 @@
-//! Оболочка OBSOS на egui: вкладки (сбоку или сверху), панель адреса,
-//! полосы уведомлений над страницей, выдвижная панель справа (закладки,
-//! история, пароли, синхронизация, оформление, настройки), диалоги страницы
+//! Оболочка OBSOS на egui: тема, полосы уведомлений над страницей,
+//! окна панелей (закладки, пароли, синхронизация, скрипты, профили),
+//! инструменты разработчика, диалоги страницы
 //! (`alert`/`confirm`/`prompt`, `<select>`, контекстное меню, цвет, файл,
-//! HTTP-вход) и всплывающие сообщения.
+//! HTTP-вход) и всплывающие сообщения. Вкладки, панель адреса и меню —
+//! `chrome.rs`; настройки, история и прочие страницы — `webui.rs`.
 //!
 //! Раскладка по мотивам Zervo (© Goddv, MPL-2.0); код свой. Значки рисуются
 //! линиями — в шрифтах egui нет стрелок.
@@ -10,8 +11,9 @@
 use egui::{Align2, Color32, CornerRadius, FontId, Margin, Pos2, Rect, RichText, Sense, Stroke, Ui, pos2, vec2};
 use servo::{ContextMenuItem, RgbColor, SelectElementOptionOrOptgroup, SimpleDialog};
 
-use crate::profile::{Look, Rgb, Search, now_ms};
-use crate::shell::{Action, Infobar, Modal, Panel, Shell, TABSTRIP_H, TOOLBAR_H, TOOLBAR_H_COMPACT, page_origin};
+use crate::chrome::{self, Icon, icon_button, paint_icon};
+use crate::profile::{Look, Rgb, TabsAt, now_ms};
+use crate::shell::{Action, Infobar, Modal, Panel, Shell};
 use crate::vault::Login;
 use browser_sync::remote::{Provider, oauth};
 
@@ -19,27 +21,28 @@ use browser_sync::remote::{Provider, oauth};
 pub const BRAND_H: f32 = 34.0;
 pub const NEW_TAB_H: f32 = 30.0;
 pub const TAB_ROW_H: f32 = 30.0;
-const DRAWER_W: f32 = 390.0;
+/// Ширина окна панели (пароли, синхронизация и др.).
+const DIALOG_W: f32 = 560.0;
 
 pub fn c(rgb: Rgb) -> Color32 {
     Color32::from_rgb(rgb.0, rgb.1, rgb.2)
 }
 
-fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
+pub fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
     let m = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
     Color32::from_rgb(m(a.r(), b.r()), m(a.g(), b.g()), m(a.b(), b.b()))
 }
 
-struct Palette {
-    accent: Color32,
-    accent2: Color32,
-    sidebar: Color32,
-    toolbar: Color32,
-    text: Color32,
-    dim: Color32,
-    hover: Color32,
-    active: Color32,
-    field: Color32,
+pub struct Palette {
+    pub accent: Color32,
+    pub accent2: Color32,
+    pub sidebar: Color32,
+    pub toolbar: Color32,
+    pub text: Color32,
+    pub dim: Color32,
+    pub hover: Color32,
+    pub active: Color32,
+    pub field: Color32,
 }
 
 fn palette(look: &Look) -> Palette {
@@ -54,7 +57,7 @@ fn palette(look: &Look) -> Palette {
         text,
         dim: mix(text, sidebar, 0.4),
         hover: mix(sidebar, text, 0.08),
-        active: if look.accent_reach >= 1 { mix(sidebar, accent, 0.35) } else { mix(sidebar, text, 0.14) },
+        active: if look.accent_reach >= 2 { mix(sidebar, accent, 0.3) } else { mix(sidebar, text, 0.12) },
         field: mix(c(look.toolbar), if look.dark { Color32::BLACK } else { Color32::WHITE }, 0.35),
     }
 }
@@ -74,128 +77,42 @@ pub fn style(ctx: &egui::Context, look: &Look) {
     v.widgets.inactive.bg_fill = button;
     v.widgets.hovered.weak_bg_fill = mix(button, p.text, 0.12);
     v.widgets.active.weak_bg_fill = p.accent;
-    for w in [&mut v.widgets.inactive, &mut v.widgets.hovered, &mut v.widgets.active, &mut v.widgets.open] {
-        w.corner_radius = CornerRadius::same(6);
+    for w in [&mut v.widgets.noninteractive, &mut v.widgets.inactive, &mut v.widgets.hovered, &mut v.widgets.active, &mut v.widgets.open] {
+        w.corner_radius = CornerRadius::same(3);
+        // Кнопки не «растут» при наведении — ровная сетка.
+        w.expansion = 0.0;
     }
-    v.window_corner_radius = CornerRadius::same(10);
+    v.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, mix(p.toolbar, p.text, 0.16));
+    v.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, mix(p.toolbar, p.text, 0.32));
+    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, mix(p.sidebar, p.text, 0.13));
+    v.window_corner_radius = CornerRadius::same(6);
+    v.menu_corner_radius = CornerRadius::same(4);
+    v.window_stroke = Stroke::new(1.0_f32, mix(p.sidebar, p.text, 0.16));
+    v.window_shadow = egui::epaint::Shadow { offset: [0, 6], blur: 18, spread: 0, color: Color32::from_black_alpha(80) };
+    v.popup_shadow = egui::epaint::Shadow { offset: [0, 3], blur: 10, spread: 0, color: Color32::from_black_alpha(60) };
     ctx.set_visuals(v);
+    ctx.all_styles_mut(|s| {
+        s.spacing.item_spacing = vec2(8.0, 7.0);
+        s.spacing.button_padding = vec2(12.0, 5.0);
+        s.spacing.interact_size.y = 26.0;
+        s.spacing.window_margin = Margin::same(18);
+        // Мелкие подписи панелей — читаемыми.
+        s.text_styles.insert(egui::TextStyle::Small, FontId::proportional(11.5));
+    });
 }
 
-// ── Значки ──────────────────────────────────────────────────────────────────
-
-#[derive(Clone, Copy)]
-enum Icon {
-    Back,
-    Forward,
-    Reload,
-    Star(bool),
-    Menu,
-    Key,
-    Plus,
-    Close,
-    /// Щит блокировки рекламы: включена (true) или выключена на сайте.
-    Shield(bool),
-    /// Режим чтения (раскрытая книга).
-    Book,
-}
-
-fn paint_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
-    let s = Stroke::new(1.8_f32, color);
-    let ctr = rect.center();
-    let r = 7.0;
-    match icon {
-        Icon::Back | Icon::Forward => {
-            let d = if matches!(icon, Icon::Back) { -1.0 } else { 1.0 };
-            painter.line_segment([ctr + vec2(-r * d, 0.0), ctr + vec2(r * d, 0.0)], s);
-            painter.line_segment([ctr + vec2(r * d, 0.0), ctr + vec2(r * d * 0.2, -r * 0.8)], s);
-            painter.line_segment([ctr + vec2(r * d, 0.0), ctr + vec2(r * d * 0.2, r * 0.8)], s);
-        }
-        Icon::Reload => {
-            let pts: Vec<Pos2> = (0..=20)
-                .map(|i| {
-                    let a = -0.6 + i as f32 / 20.0 * 5.0;
-                    ctr + vec2(a.cos() * r, a.sin() * r)
-                })
-                .collect();
-            painter.add(egui::Shape::line(pts.clone(), s));
-            let end = *pts.last().unwrap_or(&ctr);
-            painter.line_segment([end, end + vec2(4.5, -1.0)], s);
-            painter.line_segment([end, end + vec2(0.5, -4.5)], s);
-        }
-        Icon::Star(filled) => {
-            let pts: Vec<Pos2> = (0..10)
-                .map(|i| {
-                    let a = -std::f32::consts::FRAC_PI_2 + i as f32 * std::f32::consts::PI / 5.0;
-                    let rr = if i % 2 == 0 { r + 1.0 } else { r * 0.45 };
-                    ctr + vec2(a.cos() * rr, a.sin() * rr)
-                })
-                .collect();
-            if filled {
-                painter.add(egui::Shape::convex_polygon(pts.clone(), color, Stroke::NONE));
-                // Невыпуклую звезду закрашиваем лучами от центра.
-                for i in 0..10 {
-                    painter.add(egui::Shape::convex_polygon(vec![ctr, pts[i], pts[(i + 1) % 10]], color, Stroke::NONE));
-                }
-            } else {
-                painter.add(egui::Shape::closed_line(pts, s));
-            }
-        }
-        Icon::Menu => {
-            for dy in [-5.0, 0.0, 5.0] {
-                painter.line_segment([ctr + vec2(-r, dy), ctr + vec2(r, dy)], s);
-            }
-        }
-        Icon::Key => {
-            painter.circle_stroke(ctr + vec2(-3.5, 0.0), 3.5, s);
-            painter.line_segment([ctr + vec2(0.0, 0.0), ctr + vec2(r, 0.0)], s);
-            painter.line_segment([ctr + vec2(r - 1.0, 0.0), ctr + vec2(r - 1.0, 3.5)], s);
-            painter.line_segment([ctr + vec2(r - 4.0, 0.0), ctr + vec2(r - 4.0, 3.0)], s);
-        }
-        Icon::Plus => {
-            painter.line_segment([ctr + vec2(-r, 0.0), ctr + vec2(r, 0.0)], s);
-            painter.line_segment([ctr + vec2(0.0, -r), ctr + vec2(0.0, r)], s);
-        }
-        Icon::Shield(on) => {
-            let pts = vec![
-                ctr + vec2(0.0, -r),
-                ctr + vec2(r * 0.85, -r * 0.6),
-                ctr + vec2(r * 0.7, r * 0.3),
-                ctr + vec2(0.0, r),
-                ctr + vec2(-r * 0.7, r * 0.3),
-                ctr + vec2(-r * 0.85, -r * 0.6),
-            ];
-            if on {
-                painter.add(egui::Shape::convex_polygon(pts, color.gamma_multiply(0.35), s));
-            } else {
-                painter.add(egui::Shape::closed_line(pts, s));
-                painter.line_segment([ctr + vec2(-r, r), ctr + vec2(r, -r)], s);
-            }
-        }
-        Icon::Book => {
-            painter.line_segment([ctr + vec2(0.0, -r * 0.6), ctr + vec2(0.0, r * 0.8)], s);
-            painter.add(egui::Shape::closed_line(vec![ctr + vec2(0.0, -r * 0.6), ctr + vec2(-r, -r * 0.8), ctr + vec2(-r, r * 0.6), ctr + vec2(0.0, r * 0.8)], s));
-            painter.add(egui::Shape::closed_line(vec![ctr + vec2(0.0, -r * 0.6), ctr + vec2(r, -r * 0.8), ctr + vec2(r, r * 0.6), ctr + vec2(0.0, r * 0.8)], s));
-        }
-        Icon::Close => {
-            let k = r * 0.7;
-            painter.line_segment([ctr + vec2(-k, -k), ctr + vec2(k, k)], s);
-            painter.line_segment([ctr + vec2(-k, k), ctr + vec2(k, -k)], s);
-        }
+/// Шрифт системы вместо встроенного в egui (где платформа его даёт).
+pub fn fonts(ctx: &egui::Context) {
+    let Some(data) = crate::window::platform().ui_font() else { return };
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(String::from("system"), std::sync::Arc::new(egui::FontData::from_owned(data)));
+    if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+        family.insert(0, String::from("system"));
     }
+    ctx.set_fonts(fonts);
 }
 
-fn icon_button(ui: &mut Ui, icon: Icon, enabled: bool, tip: &str, p: &Palette) -> bool {
-    let (rect, response) = ui.allocate_exact_size(vec2(30.0, 28.0), if enabled { Sense::click() } else { Sense::hover() });
-    if response.hovered() && enabled {
-        ui.painter().rect_filled(rect, 6.0, p.hover);
-    }
-    let color = if enabled { p.text } else { mix(p.text, p.toolbar, 0.6) };
-    let color = if matches!(icon, Icon::Star(true)) { p.accent2 } else { color };
-    paint_icon(ui.painter(), rect, icon, color);
-    response.on_hover_text(tip).clicked() && enabled
-}
-
-fn clip(text: &str, max: usize) -> String {
+pub fn clip(text: &str, max: usize) -> String {
     if text.chars().count() <= max {
         text.to_string()
     } else {
@@ -223,28 +140,49 @@ pub fn shell_ui(ui: &mut Ui, shell: &mut Shell, actions: &mut Vec<Action>) {
     actions.clear();
     let look = shell.look().clone();
     let p = palette(&look);
-    if look.side_tabs {
-        sidebar(ui, shell, &look, &p, actions);
-    } else {
-        tabstrip(ui, shell, &p, actions);
+    let full = crate::shell::fullscreen();
+    if !full {
+        // Порядок панелей: боковая — на всю высоту, горизонтальная полоса
+        // сверху — над панелью адреса.
+        chrome::tabs(ui, shell, &look, &p, actions);
+        chrome::toolbar(ui, shell, &look, &p, actions);
     }
-    toolbar(ui, shell, &look, &p, actions);
     let ctx = ui.ctx().clone();
-    let (ox, oy) = page_origin(&look);
     let screen = ctx.content_rect();
-    // Страница — без встроенных справа инструментов разработчика.
-    let dock = crate::shell::dev_dock() as f32;
-    let bar = crate::shell::downloads_bar() as f32;
-    let page = Rect::from_min_max(pos2(ox as f32, oy as f32), pos2(screen.max.x - dock, screen.max.y - bar));
-    if bar > 0.0 {
-        downloads_bar(&ctx, shell, Rect::from_min_max(pos2(screen.min.x, screen.max.y - bar), screen.max), &p, actions);
+    let (left, top, right, bottom) = crate::shell::chrome_margins(&look);
+    let page = Rect::from_min_max(
+        pos2(left as f32, top as f32),
+        pos2((screen.max.x - right as f32).max(left as f32 + 1.0), (screen.max.y - bottom as f32).max(top as f32 + 1.0)),
+    );
+    // Полоса загрузок: пока выезжает — лежит поверх страницы, потом страница
+    // становится на неё ниже (`app.rs`).
+    if !full && shell.chrome.bar_since.is_some() {
+        let h = crate::shell::DOWNLOADS_BAR_H as f32;
+        let floor = screen.max.y - if look.tabs == TabsAt::Bottom { crate::shell::TABSTRIP_H as f32 } else { 0.0 };
+        let t = shell.chrome.bar_since.map(|at| at.elapsed().as_secs_f32() / chrome::BAR_SLIDE).unwrap_or(1.0).min(1.0);
+        if t < 1.0 {
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        }
+        let rise = h * (1.0 - (1.0 - t) * (1.0 - t));
+        downloads_bar(&ctx, shell, Rect::from_min_size(pos2(screen.min.x, floor - rise), vec2(screen.width(), h)), &p, actions);
     }
     overlays(&ctx, shell, page, &p, actions);
-    if let Some(panel) = shell.panel {
-        drawer(&ctx, shell, panel, page, &p, actions);
+    match shell.panel {
+        Some(Panel::Menu) => chrome::main_menu(&ctx, shell, &p, actions),
+        Some(Panel::DevTools) => dev_panel(&ctx, shell, page, &p),
+        Some(Panel::Downloads) => chrome::downloads_popup(&ctx, shell, &p, actions),
+        Some(panel) => dialog(&ctx, shell, panel, &p, actions),
+        None => {}
+    }
+    if shell.panel != Some(Panel::Menu) {
+        ctx.animate_bool_with_time(egui::Id::new("obsos-menu-open"), false, 0.0);
     }
     if shell.find.open {
         find_bar(&ctx, shell, page, &p, actions);
+    }
+    chrome::tab_menu(&ctx, shell, &p, actions);
+    if !full {
+        chrome::download_flights(&ctx, shell, page, &p);
     }
     modal(&ctx, shell, page, &p, actions);
     toasts(&ctx, shell, page, &p);
@@ -257,7 +195,7 @@ fn find_bar(ctx: &egui::Context, shell: &mut Shell, page: Rect, p: &Palette, act
         .order(egui::Order::Foreground)
         .anchor(Align2::RIGHT_TOP, vec2(-(ctx.content_rect().max.x - page.right()) - 12.0, page.top() + 8.0))
         .show(ctx, |ui| {
-            egui::Frame::new().fill(p.toolbar).corner_radius(8).inner_margin(Margin::symmetric(10, 6)).stroke(Stroke::new(1.0_f32, p.accent)).show(ui, |ui| {
+            egui::Frame::new().fill(p.toolbar).corner_radius(4).inner_margin(Margin::symmetric(10, 6)).stroke(Stroke::new(1.0_f32, p.accent)).show(ui, |ui| {
                 ui.horizontal(|ui| {
                     let edit = ui.add(egui::TextEdit::singleline(&mut shell.find.text).id(id).hint_text("Найти на странице").desired_width(220.0));
                     if shell.find.focus {
@@ -286,205 +224,6 @@ fn find_bar(ctx: &egui::Context, shell: &mut Shell, page: Rect, p: &Palette, act
         });
 }
 
-fn sidebar(ui: &mut Ui, shell: &mut Shell, look: &Look, p: &Palette, actions: &mut Vec<Action>) {
-    egui::Panel::left("obsos-tabs")
-        .exact_size(look.sidebar_width as f32)
-        .resizable(false)
-        .show_separator_line(false)
-        .frame(egui::Frame::new().fill(p.sidebar).inner_margin(Margin::symmetric(8, 0)))
-        .show_inside(ui, |ui| {
-            let width = ui.available_width();
-            let (rect, _) = ui.allocate_exact_size(vec2(width, BRAND_H), Sense::hover());
-            let painter = ui.painter();
-            painter.circle_filled(pos2(rect.left() + 10.0, rect.center().y), 7.0, p.accent);
-            painter.circle_filled(pos2(rect.left() + 20.0, rect.center().y - 5.0), 3.0, p.accent2);
-            let brand = painter.text(pos2(rect.left() + 30.0, rect.center().y), Align2::LEFT_CENTER, "OBSOS", FontId::proportional(18.0), p.text);
-            if shell.profile.private {
-                // Окно инкогнито видно сразу: метка рядом с именем.
-                let badge = Rect::from_min_size(pos2(brand.right() + 8.0, rect.center().y - 10.0), vec2(84.0, 20.0));
-                painter.rect_filled(badge, 10.0, mix(p.accent, p.sidebar, 0.35));
-                painter.text(badge.center(), Align2::CENTER_CENTER, "инкогнито", FontId::proportional(12.0), Color32::WHITE);
-            }
-            let new_tab = egui::Button::new(RichText::new("+  Новая вкладка").color(p.text)).fill(mix(p.sidebar, p.text, 0.1)).corner_radius(8);
-            if ui.add_sized([width, NEW_TAB_H], new_tab).on_hover_text("Ctrl+T").clicked() {
-                actions.push(Action::NewTab);
-            }
-            ui.add_space(6.0);
-            ui.spacing_mut().item_spacing.y = 2.0;
-            let rows_h = ui.available_height() - 40.0;
-            egui::ScrollArea::vertical().max_height(rows_h.max(60.0)).show(ui, |ui| {
-                for i in 0..shell.tabs.len() {
-                    tab_row(ui, shell, i, width, p, actions);
-                }
-            });
-            // Внизу: вкладки других устройств и синхронизация.
-            ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    let synced = shell.account().is_some();
-                    let label = if shell.syncer.busy > 0 { "⟳ синхронизация…" } else if synced { "☁ синхронизация" } else { "☁ без синхронизации" };
-                    if ui.add(egui::Button::new(RichText::new(label).size(12.0).color(p.dim)).frame(false)).clicked() {
-                        actions.push(Action::Panel(Panel::Sync));
-                    }
-                });
-            });
-        });
-}
-
-fn tab_row(ui: &mut Ui, shell: &Shell, i: usize, width: f32, p: &Palette, actions: &mut Vec<Action>) {
-    let tab = &shell.tabs[i];
-    let (rect, response) = ui.allocate_exact_size(vec2(width, TAB_ROW_H), Sense::click());
-    let close = Rect::from_center_size(pos2(rect.right() - 14.0, rect.center().y), vec2(20.0, 20.0));
-    let over_close = response.hover_pos().is_some_and(|q| close.contains(q));
-    let fill = if i == shell.active {
-        p.active
-    } else if response.hovered() {
-        p.hover
-    } else {
-        p.sidebar
-    };
-    let painter = ui.painter();
-    painter.rect_filled(rect, 7.0, fill);
-    if i == shell.active {
-        painter.rect_filled(Rect::from_min_size(rect.left_top() + vec2(0.0, 6.0), vec2(3.0, TAB_ROW_H - 12.0)), 2.0, p.accent2);
-    }
-    let mark = if tab.loading { "◌ " } else { "" };
-    painter.text(
-        pos2(rect.left() + 12.0, rect.center().y),
-        Align2::LEFT_CENTER,
-        format!("{mark}{}", clip(&tab.title, ((width - 50.0) / 8.0) as usize)),
-        FontId::proportional(14.0),
-        if i == shell.active { p.text } else { p.dim },
-    );
-    if response.hovered() || i == shell.active {
-        if over_close {
-            painter.rect_filled(close, 4.0, p.hover);
-        }
-        paint_icon(painter, close.shrink(3.0), Icon::Close, p.dim);
-    }
-    if response.clicked() {
-        actions.push(if over_close { Action::Close(i) } else { Action::Activate(i) });
-    }
-    if response.middle_clicked() {
-        actions.push(Action::Close(i));
-    }
-}
-
-fn tabstrip(ui: &mut Ui, shell: &mut Shell, p: &Palette, actions: &mut Vec<Action>) {
-    egui::Panel::top("obsos-strip")
-        .exact_size(TABSTRIP_H as f32)
-        .resizable(false)
-        .show_separator_line(false)
-        .frame(egui::Frame::new().fill(p.sidebar).inner_margin(Margin::symmetric(6, 4)))
-        .show_inside(ui, |ui| {
-            ui.horizontal(|ui| {
-                let n = shell.tabs.len().max(1) as f32;
-                let width = ((ui.available_width() - 40.0) / n).clamp(80.0, 220.0);
-                ui.spacing_mut().item_spacing.x = 3.0;
-                for i in 0..shell.tabs.len() {
-                    tab_row(ui, shell, i, width, p, actions);
-                }
-                if icon_button(ui, Icon::Plus, true, "Новая вкладка (Ctrl+T)", p) {
-                    actions.push(Action::NewTab);
-                }
-            });
-        });
-}
-
-fn toolbar(ui: &mut Ui, shell: &mut Shell, look: &Look, p: &Palette, actions: &mut Vec<Action>) {
-    let height = if look.compact { TOOLBAR_H_COMPACT } else { TOOLBAR_H } as f32;
-    let address_id = egui::Id::new("obsos-address");
-    egui::Panel::top("obsos-bar")
-        .exact_size(height)
-        .resizable(false)
-        .show_separator_line(false)
-        .frame(egui::Frame::new().fill(p.toolbar).inner_margin(Margin::symmetric(8, if look.compact { 4 } else { 7 })))
-        .show_inside(ui, |ui| {
-            ui.horizontal_centered(|ui| {
-                let (back, forward) = shell.active_view().map(|w| (w.can_go_back(), w.can_go_forward())).unwrap_or((false, false));
-                if icon_button(ui, Icon::Back, back, "Назад (Alt+Влево)", p) {
-                    actions.push(Action::Back);
-                }
-                if icon_button(ui, Icon::Forward, forward, "Вперёд (Alt+Вправо)", p) {
-                    actions.push(Action::Forward);
-                }
-                if icon_button(ui, Icon::Reload, true, "Обновить (F5)", p) {
-                    actions.push(Action::Reload);
-                }
-                let url = shell.tabs.get(shell.active).and_then(|t| t.real_url.clone());
-                let origin = url.as_ref().and_then(crate::vault::origin_of);
-                let has_logins = origin.as_ref().is_some_and(|o| !shell.profile.logins_for(o).is_empty());
-                let marked = url.as_ref().is_some_and(|u| shell.profile.is_bookmarked(u.as_str()));
-                let web = url.as_ref().is_some_and(|u| u.scheme().starts_with("http"));
-                // Кнопки справа: ширина 30 и промежуток между ними.
-                let gap = ui.spacing().item_spacing.x;
-                let icons = 2.0 + has_logins as u8 as f32 + 2.0 * web as u8 as f32;
-                let right = (30.0 + gap) * icons + if web { 22.0 + gap } else { 0.0 } + 12.0;
-                if shell.focus_address {
-                    ui.memory_mut(|m| m.request_focus(address_id));
-                    shell.focus_address = false;
-                    // Как в Chromium: Ctrl+L / F6 / Alt+D выделяют весь адрес —
-                    // набранное заменяет его, а не дописывается в конец.
-                    let mut state = egui::text_edit::TextEditState::load(ui.ctx(), address_id).unwrap_or_default();
-                    let len = shell.address.chars().count();
-                    state.cursor.set_char_range(Some(egui::text::CCursorRange::two(egui::text::CCursor::new(0), egui::text::CCursor::new(len))));
-                    state.store(ui.ctx(), address_id);
-                }
-                let secure = url.as_ref().is_some_and(|u| u.scheme() == "https" || u.scheme() == "obsos");
-                let plain = secure || shell.address.is_empty();
-                let hint = format!("Адрес или поиск в {}", shell.profile.settings.search.title());
-                let edit = egui::TextEdit::singleline(&mut shell.address)
-                    .id(address_id)
-                    .hint_text(hint)
-                    .font(FontId::proportional(15.0))
-                    .margin(Margin::symmetric(10, 5))
-                    .text_color(if plain { p.text } else { mix(p.text, Color32::from_rgb(0xe0, 0x90, 0x40), 0.5) })
-                    .desired_width(ui.available_width() - right);
-                let response = ui.add(edit);
-                if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    actions.push(Action::Go(shell.address.clone()));
-                }
-                if has_logins && icon_button(ui, Icon::Key, true, "Подставить сохранённый пароль", p) {
-                    if let Some(o) = &origin {
-                        shell.infobars.retain(|b| !matches!(b, Infobar::ChooseLogin(_)));
-                        shell.infobars.push(Infobar::ChooseLogin(o.clone()));
-                    }
-                }
-                if web {
-                    let host = url.as_ref().and_then(|u| u.host_str().map(str::to_string)).unwrap_or_default();
-                    let (enabled, allowed) = {
-                        let b = shell.delegate.blocker.borrow();
-                        (b.enabled, b.allows(&host))
-                    };
-                    let count = shell.tabs.get(shell.active).map(|t| t.blocked).unwrap_or(0);
-                    let tip = if !enabled {
-                        String::from("Блокировка рекламы выключена (Настройки)")
-                    } else if allowed {
-                        format!("Реклама на {host} не блокируется — включить")
-                    } else {
-                        format!("Заблокировано рекламы и трекеров: {count}. Щелчок — не блокировать на {host}")
-                    };
-                    if icon_button(ui, Icon::Shield(enabled && !allowed), enabled, &tip, p) {
-                        actions.push(Action::ToggleBlockSite);
-                    }
-                    let (r, _) = ui.allocate_exact_size(vec2(22.0, 28.0), Sense::hover());
-                    if enabled && !allowed && count > 0 {
-                        ui.painter().text(r.left_center(), Align2::LEFT_CENTER, if count > 99 { String::from("99+") } else { count.to_string() }, FontId::proportional(11.0), p.accent2);
-                    }
-                    if icon_button(ui, Icon::Book, true, "Режим чтения", p) {
-                        actions.push(Action::Reader);
-                    }
-                }
-                if icon_button(ui, Icon::Star(marked), url.is_some(), "Закладка (Ctrl+D)", p) {
-                    actions.push(Action::ToggleBookmark);
-                }
-                if icon_button(ui, Icon::Menu, true, "Меню", p) {
-                    actions.push(Action::Panel(Panel::Menu));
-                }
-            });
-        });
-}
-
 /// Полоса загрузки, подсказка ссылки, полосы уведомлений.
 fn overlays(ctx: &egui::Context, shell: &mut Shell, page: Rect, p: &Palette, actions: &mut Vec<Action>) {
     let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Middle, egui::Id::new("obsos-overlay")));
@@ -494,13 +233,14 @@ fn overlays(ctx: &egui::Context, shell: &mut Shell, page: Rect, p: &Palette, act
             let w = page.width() * 0.3;
             let x = page.left() + (page.width() + w) * t - w;
             painter.rect_filled(Rect::from_min_size(pos2(x.max(page.left()), page.top()), vec2(w, 3.0)), 0.0, p.accent2);
-            ctx.request_repaint_after(std::time::Duration::from_millis(60));
+            // С видеокартой полоса едет каждый кадр экрана.
+            ctx.request_repaint_after(std::time::Duration::from_millis(if shell.gpu_active { 1 } else { 60 }));
         }
         if let Some(status) = &tab.status {
             let text = clip(status, 90);
             let galley = painter.layout_no_wrap(text, FontId::proportional(12.0), p.text);
             let r = Rect::from_min_size(pos2(page.left() + 4.0, page.bottom() - galley.size().y - 10.0), galley.size() + vec2(12.0, 6.0));
-            painter.rect_filled(r, 5.0, p.toolbar);
+            painter.rect_filled(r, 3.0, p.toolbar);
             painter.galley(r.min + vec2(6.0, 3.0), galley, p.text);
         }
     }
@@ -511,7 +251,7 @@ fn overlays(ctx: &egui::Context, shell: &mut Shell, page: Rect, p: &Palette, act
     egui::Area::new(egui::Id::new("obsos-infobars")).order(egui::Order::Foreground).fixed_pos(page.min + vec2(8.0, 6.0)).show(ctx, |ui| {
         ui.set_width(page.width() - 16.0);
         for (index, bar) in bars.iter().enumerate() {
-            egui::Frame::new().fill(p.toolbar).corner_radius(8).inner_margin(Margin::symmetric(12, 8)).stroke(Stroke::new(1.0_f32, p.accent)).show(ui, |ui| {
+            egui::Frame::new().fill(p.toolbar).corner_radius(4).inner_margin(Margin::symmetric(12, 8)).stroke(Stroke::new(1.0_f32, p.accent)).show(ui, |ui| {
                 ui.horizontal_wrapped(|ui| match bar {
                     Infobar::SaveLogin(login) => {
                         ui.label(format!("Сохранить пароль для {} ({})?", login.origin, if login.username.is_empty() { "без имени" } else { &login.username }));
@@ -574,76 +314,118 @@ fn toasts(ctx: &egui::Context, shell: &mut Shell, page: Rect, p: &Palette) {
         return;
     }
     ctx.request_repaint_after(std::time::Duration::from_millis(500));
-    egui::Area::new(egui::Id::new("obsos-toasts")).order(egui::Order::Tooltip).anchor(Align2::RIGHT_BOTTOM, vec2(-16.0, -16.0)).show(ctx, |ui| {
-        for (text, _) in &shell.toasts {
-            egui::Frame::new().fill(p.toolbar).corner_radius(8).inner_margin(Margin::symmetric(14, 9)).stroke(Stroke::new(1.0_f32, p.accent2)).show(ui, |ui| {
-                ui.set_max_width(page.width().min(420.0));
-                ui.label(text);
-            });
-        }
+    // Снизу по середине страницы, над ней.
+    egui::Area::new(egui::Id::new("obsos-toasts")).order(egui::Order::Tooltip).pivot(Align2::CENTER_BOTTOM).fixed_pos(pos2(page.center().x, page.bottom() - 20.0)).show(ctx, |ui| {
+        ui.vertical_centered(|ui| {
+            for (text, _) in &shell.toasts {
+                egui::Frame::new()
+                    .fill(p.toolbar)
+                    .corner_radius(4)
+                    .inner_margin(Margin::symmetric(18, 9))
+                    .stroke(Stroke::new(1.0_f32, mix(p.toolbar, p.accent2, 0.6)))
+                    .shadow(egui::epaint::Shadow { offset: [0, 6], blur: 18, spread: 0, color: Color32::from_black_alpha(90) })
+                    .show(ui, |ui| {
+                        ui.set_max_width(page.width().min(460.0));
+                        ui.label(text);
+                    });
+            }
+        });
     });
 }
 
-// ── Выдвижная панель ────────────────────────────────────────────────────────
+// ── Панели ────────────────────────────────────────────────────────
 
-fn drawer(ctx: &egui::Context, shell: &mut Shell, panel: Panel, page: Rect, p: &Palette, actions: &mut Vec<Action>) {
-    // Инструменты разработчика встроены справа (страница уже на их ширину,
-    // `dev_dock`), ширина — перетаскиванием левого края; остальные панели —
-    // поверх страницы.
-    let dev = panel == Panel::DevTools;
-    let docked = dev && crate::shell::dev_dock() > 0;
-    let width = if dev { shell.dev.width } else { DRAWER_W.min(page.width()) };
-    let left = if docked { page.right() } else { page.right() - width };
-    if dev {
-        let handle = egui::Area::new(egui::Id::new("obsos-dev-split")).order(egui::Order::Tooltip).fixed_pos(pos2(left - 4.0, page.top())).show(ctx, |ui| {
-            let (r, resp) = ui.allocate_exact_size(vec2(8.0, page.height()), Sense::drag());
-            let active = resp.hovered() || resp.dragged();
-            if active {
-                ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
-            }
-            ui.painter().line_segment([pos2(r.center().x, r.top()), pos2(r.center().x, r.bottom())], Stroke::new(if active { 3.0_f32 } else { 1.0 }, if active { p.accent } else { mix(p.sidebar, p.text, 0.25) }));
-            resp.drag_delta().x
-        });
-        let dx = handle.inner;
-        if dx != 0.0 {
-            let max = (ctx.content_rect().width() - 300.0).max(320.0);
-            shell.dev.width = (shell.dev.width - dx).clamp(280.0, max);
-        }
+/// Инструменты разработчика: встроены справа или снизу (страница на столько
+/// меньше), край перетаскивается.
+fn dev_panel(ctx: &egui::Context, shell: &mut Shell, page: Rect, p: &Palette) {
+    let bottom = crate::shell::dev_dock_bottom() > 0;
+    let rect = if bottom {
+        Rect::from_min_size(page.left_bottom(), vec2(page.width(), crate::shell::dev_dock_bottom() as f32))
+    } else {
+        Rect::from_min_size(page.right_top(), vec2(crate::shell::dev_dock() as f32, page.height()))
+    };
+    if !rect.is_positive() {
+        return;
     }
-    egui::Area::new(egui::Id::new("obsos-drawer"))
+    egui::Area::new(egui::Id::new("obsos-devtools")).order(egui::Order::Foreground).fixed_pos(rect.min).show(ctx, |ui| {
+        ui.painter().rect_filled(rect, 0.0, p.sidebar);
+        ui.allocate_rect(rect, Sense::hover());
+        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect.shrink2(vec2(8.0, 4.0))).layout(egui::Layout::top_down(egui::Align::Min)));
+        child.set_clip_rect(rect);
+        crate::devtools::ui(&mut child, shell);
+    });
+    let grip = if bottom { Rect::from_min_size(rect.left_top() - vec2(0.0, 3.0), vec2(rect.width(), 7.0)) } else { Rect::from_min_size(rect.left_top() - vec2(3.0, 0.0), vec2(7.0, rect.height())) };
+    let handle = egui::Area::new(egui::Id::new("obsos-dev-split")).order(egui::Order::Tooltip).fixed_pos(grip.min).show(ctx, |ui| {
+        let (r, resp) = ui.allocate_exact_size(grip.size(), Sense::drag());
+        let active = resp.hovered() || resp.dragged();
+        if active {
+            ui.ctx().set_cursor_icon(if bottom { egui::CursorIcon::ResizeVertical } else { egui::CursorIcon::ResizeHorizontal });
+        }
+        let line = if bottom { [pos2(r.left(), r.center().y), pos2(r.right(), r.center().y)] } else { [pos2(r.center().x, r.top()), pos2(r.center().x, r.bottom())] };
+        ui.painter().line_segment(line, Stroke::new(if active { 3.0_f32 } else { 1.0 }, if active { p.accent } else { mix(p.sidebar, p.text, 0.22) }));
+        resp.drag_delta()
+    });
+    let delta = handle.inner;
+    let screen = ctx.content_rect();
+    if bottom && delta.y != 0.0 {
+        shell.dev.height = (shell.dev.height - delta.y).clamp(140.0, (screen.height() - 200.0).max(160.0));
+    } else if !bottom && delta.x != 0.0 {
+        shell.dev.width = (shell.dev.width - delta.x).clamp(300.0, (screen.width() - 300.0).max(320.0));
+    }
+}
+
+/// Окно панели по центру: заголовок, крестик, содержимое с прокруткой; фон
+/// затемнён, щелчок по нему закрывает.
+fn dialog(ctx: &egui::Context, shell: &mut Shell, panel: Panel, p: &Palette, actions: &mut Vec<Action>) {
+    let screen = ctx.content_rect();
+    let shade = egui::Area::new(egui::Id::new("obsos-shade")).order(egui::Order::Middle).fixed_pos(screen.min).show(ctx, |ui| {
+        let (r, response) = ui.allocate_exact_size(screen.size(), Sense::click());
+        ui.painter().rect_filled(r, 0.0, Color32::from_black_alpha(110));
+        response
+    });
+    // Щелчок, открывший окно из меню, фон ещё не получает — меню уже закрыто.
+    if shade.inner.clicked() {
+        shell.panel = None;
+    }
+    let width = DIALOG_W.min(screen.width() - 32.0).max(280.0);
+    let height = (screen.height() - 120.0).clamp(200.0, 640.0);
+    egui::Area::new(egui::Id::new("obsos-dialog"))
         .order(egui::Order::Foreground)
-        .fixed_pos(pos2(left, page.top()))
+        .pivot(Align2::CENTER_TOP)
+        .fixed_pos(pos2(screen.center().x, screen.top() + ((screen.height() - height) * 0.4).max(12.0)))
         .show(ctx, |ui| {
-            egui::Frame::new().fill(p.sidebar).inner_margin(Margin::same(14)).stroke(Stroke::new(1.0_f32, mix(p.sidebar, p.text, 0.15))).show(ui, |ui| {
-                ui.set_width(width - 28.0);
-                ui.set_height(page.height() - 28.0);
-                ui.horizontal(|ui| {
-                    if panel != Panel::Menu && icon_button(ui, Icon::Back, true, "Меню", p) {
-                        shell.panel = Some(Panel::Menu);
-                    }
-                    ui.heading(panel_title(panel));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if icon_button(ui, Icon::Close, true, "Закрыть", p) {
-                            shell.panel = None;
+            egui::Frame::new()
+                .fill(p.toolbar)
+                .stroke(Stroke::new(1.0_f32, mix(p.toolbar, p.text, 0.2)))
+                .corner_radius(6)
+                .shadow(egui::epaint::Shadow { offset: [0, 8], blur: 28, spread: 0, color: Color32::from_black_alpha(110) })
+                .inner_margin(Margin::same(16))
+                .show(ui, |ui| {
+                    ui.set_width(width - 32.0);
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(panel_title(panel)).size(17.0).strong());
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if icon_button(ui, Icon::Close, true, "Закрыть (Esc)", p) {
+                                shell.panel = None;
+                            }
+                        });
+                    });
+                    ui.separator();
+                    egui::ScrollArea::vertical().max_height(height - 80.0).min_scrolled_height(height - 80.0).auto_shrink([false, true]).show(ui, |ui| {
+                        // Длинные строки переносятся, а не растягивают окно.
+                        ui.set_max_width(width - 44.0);
+                        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+                        match panel {
+                            Panel::Menu | Panel::DevTools | Panel::Downloads => {}
+                            Panel::Bookmarks => bookmarks(ui, shell, actions),
+                            Panel::Passwords => passwords(ui, shell),
+                            Panel::RemoteTabs => remote_tabs(ui, shell, actions),
+                            Panel::Sync => sync_panel(ui, shell, actions),
+                            Panel::Scripts => scripts(ui, shell),
+                            Panel::Profiles => profiles(ui, shell),
                         }
                     });
                 });
-                ui.separator();
-                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| match panel {
-                    Panel::Menu => menu(ui, shell, actions),
-                    Panel::Bookmarks => bookmarks(ui, shell, actions),
-                    Panel::History => history(ui, shell, actions),
-                    Panel::Passwords => passwords(ui, shell),
-                    Panel::RemoteTabs => remote_tabs(ui, shell, actions),
-                    Panel::Sync => sync_panel(ui, shell, actions),
-                    Panel::Looks => looks(ui, shell),
-                    Panel::Settings => settings(ui, shell, actions),
-                    Panel::Scripts => scripts(ui, shell),
-                    Panel::Profiles => profiles(ui, shell),
-                    Panel::Downloads => downloads(ui, shell, actions),
-                    Panel::DevTools => crate::devtools::ui(ui, shell, actions),
-                });
-            });
         });
 }
 
@@ -651,12 +433,9 @@ fn panel_title(panel: Panel) -> &'static str {
     match panel {
         Panel::Menu => "Меню",
         Panel::Bookmarks => "Закладки",
-        Panel::History => "История",
         Panel::Passwords => "Пароли",
         Panel::RemoteTabs => "Вкладки других устройств",
         Panel::Sync => "Синхронизация",
-        Panel::Looks => "Оформление",
-        Panel::Settings => "Настройки",
         Panel::Scripts => "Скрипты и стили",
         Panel::Profiles => "Профили",
         Panel::Downloads => "Загрузки",
@@ -664,71 +443,8 @@ fn panel_title(panel: Panel) -> &'static str {
     }
 }
 
-fn menu(ui: &mut Ui, shell: &mut Shell, actions: &mut Vec<Action>) {
-    let item = |ui: &mut Ui, text: &str| ui.add_sized([ui.available_width(), 30.0], egui::Button::new(text)).clicked();
-    if item(ui, "Новая вкладка    Ctrl+T") {
-        actions.push(Action::NewTab);
-        shell.panel = None;
-    }
-    for (panel, text) in [
-        (Panel::Bookmarks, "Закладки    Ctrl+Shift+O"),
-        (Panel::History, "История    Ctrl+H"),
-        (Panel::Passwords, "Пароли"),
-        (Panel::RemoteTabs, "Вкладки других устройств"),
-        (Panel::Sync, "Синхронизация"),
-        (Panel::Looks, "Оформление"),
-        (Panel::Settings, "Настройки"),
-        (Panel::Scripts, "Скрипты и стили (вместо расширений)"),
-        (Panel::Downloads, "Загрузки    Ctrl+J"),
-        (Panel::DevTools, "Инструменты разработчика    F12"),
-        (Panel::Profiles, "Профили"),
-    ] {
-        if item(ui, text) {
-            actions.push(Action::Panel(panel));
-        }
-    }
-    ui.separator();
-    ui.horizontal(|ui| {
-        ui.label("Масштаб");
-        let zoom = shell.tabs.get(shell.active).map(|t| t.zoom).unwrap_or(1.0);
-        if ui.button(" − ").clicked() {
-            actions.push(Action::Zoom(1.0 / 1.1));
-        }
-        if ui.button(format!("{:.0}%", zoom * 100.0)).clicked() {
-            actions.push(Action::Zoom(0.0));
-        }
-        if ui.button(" + ").clicked() {
-            actions.push(Action::Zoom(1.1));
-        }
-    });
-    if item(ui, "Новое окно инкогнито    Ctrl+Shift+N") {
-        actions.push(Action::PrivateWindow);
-        shell.panel = None;
-    }
-    if item(ui, "Режим чтения") {
-        actions.push(Action::Reader);
-        shell.panel = None;
-    }
-    if item(ui, "Найти на странице    Ctrl+F") {
-        actions.push(Action::FindOpen);
-        shell.panel = None;
-    }
-    if item(ui, "Открыть страницу в Chromium") {
-        actions.push(Action::Chromium(String::new()));
-    }
-    if item(ui, "О программе") {
-        actions.push(Action::NewTabUrl(String::from("obsos://about")));
-        shell.panel = None;
-    }
-    if item(ui, "Выход    Ctrl+Shift+Q") {
-        actions.push(Action::Quit);
-    }
-    ui.separator();
-    ui.label(RichText::new(format!("Профиль: {} · устройство {}", shell.profile.name, shell.profile.settings.device)).small());
-}
-
 fn filter_box(ui: &mut Ui, shell: &mut Shell, hint: &str) -> String {
-    ui.add(egui::TextEdit::singleline(&mut shell.filter).hint_text(hint).desired_width(f32::INFINITY));
+    ui.add(egui::TextEdit::singleline(&mut shell.filter).hint_text(hint).margin(Margin::symmetric(8, 6)).desired_width(f32::INFINITY));
     shell.filter.to_lowercase()
 }
 
@@ -739,7 +455,7 @@ fn bookmarks(ui: &mut Ui, shell: &mut Shell, actions: &mut Vec<Action>) {
     let f = filter_box(ui, shell, "Найти в закладках");
     let mut remove = None;
     for b in shell.profile.bookmarks.iter().filter(|b| f.is_empty() || b.url.to_lowercase().contains(&f) || b.title.to_lowercase().contains(&f)) {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if ui.small_button("×").on_hover_text("Удалить").clicked() {
                 remove = Some(b.url.clone());
             }
@@ -755,29 +471,6 @@ fn bookmarks(ui: &mut Ui, shell: &mut Shell, actions: &mut Vec<Action>) {
     if let Some(url) = remove {
         shell.profile.remove_bookmark(&url);
         shell.update_page_data();
-    }
-}
-
-fn history(ui: &mut Ui, shell: &mut Shell, actions: &mut Vec<Action>) {
-    let f = filter_box(ui, shell, "Найти в истории");
-    if ui.button("Очистить историю").clicked() {
-        shell.modal = Some(Modal::Rollback(String::from("\u{0}history")));
-    }
-    let mut forget = None;
-    for v in shell.profile.history.iter().filter(|v| f.is_empty() || v.url.to_lowercase().contains(&f) || v.title.to_lowercase().contains(&f)).take(300) {
-        ui.horizontal(|ui| {
-            if ui.small_button("×").clicked() {
-                forget = Some(v.url.clone());
-            }
-            ui.label(RichText::new(when(v.last_ms)).small());
-            let title = if v.title.is_empty() { &v.url } else { &v.title };
-            if ui.link(clip(title, 34)).on_hover_text(format!("{} · {} раз", v.url, v.count)).clicked() {
-                actions.push(Action::OpenUrl(v.url.clone()));
-            }
-        });
-    }
-    if let Some(url) = forget {
-        shell.profile.forget(&url);
     }
 }
 
@@ -807,7 +500,7 @@ fn passwords(ui: &mut Ui, shell: &mut Shell) {
     for (record, login) in entries.iter().filter(|(_, l)| f.is_empty() || l.origin.to_lowercase().contains(&f) || l.username.to_lowercase().contains(&f)) {
         ui.group(|ui| {
             ui.label(RichText::new(&login.origin).strong());
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label(if login.username.is_empty() { "(без имени)" } else { &login.username });
                 let shown = shell.show_passwords.contains(record);
                 ui.label(if shown { login.password.clone() } else { "••••••••".into() });
@@ -868,11 +561,11 @@ fn check_leak(shell: &mut Shell, record: String, password: String) {
 /// Генератор паролей, импорт и экспорт паролей и закладок.
 fn password_tools(ui: &mut Ui, shell: &mut Shell) {
     egui::CollapsingHeader::new("Сгенерировать пароль").show(ui, |ui| {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.add(egui::Slider::new(&mut shell.tools.gen_len, 8..=64).text("знаков"));
             ui.checkbox(&mut shell.tools.gen_symbols, "знаки !#$");
         });
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if ui.button("Сгенерировать").clicked() {
                 shell.tools.generated = crate::tools::generate_password(shell.tools.gen_len, shell.tools.gen_symbols);
             }
@@ -947,51 +640,6 @@ fn password_tools(ui: &mut Ui, shell: &mut Shell) {
     });
 }
 
-/// Списки фильтров: EasyList + EasyPrivacy (+ RuAdList) скачиваются в фоне.
-fn blocker_lists(ui: &mut Ui, shell: &mut Shell) {
-    let (rules, total) = {
-        let b = shell.delegate.blocker.borrow();
-        (b.filter_rules, b.blocked_total)
-    };
-    ui.label(RichText::new(format!("Правил из списков: {rules}; заблокировано запросов за сеанс: {total}. Щит в адресной строке выключает блокировку на сайте.")).small());
-    let done = shell.tools.filters.lock().ok().and_then(|mut f| f.take());
-    if let Some(result) = done {
-        shell.tools.filters_busy = false;
-        let msg = match result {
-            Ok(text) => format!("Списки обновлены: {} доменов", shell.delegate.blocker.borrow_mut().store_filters(&text)),
-            Err(e) => format!("Списки не скачались: {e}"),
-        };
-        shell.toast(&msg);
-    }
-    if shell.tools.filters_busy {
-        ui.label("Скачиваю списки…");
-        ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
-    } else if ui.button("Скачать/обновить списки (EasyList, EasyPrivacy, RuAdList)").clicked() {
-        shell.tools.filters_busy = true;
-        let slot = shell.tools.filters.clone();
-        let _ = std::thread::Builder::new().name(String::from("obsos-filters")).spawn(move || {
-            use browser_sync::remote::{Http, Request};
-            let mut all = String::new();
-            let mut errors = Vec::new();
-            for url in [
-                "https://easylist.to/easylist/easylist.txt",
-                "https://easylist.to/easylist/easyprivacy.txt",
-                "https://easylist-downloads.adblockplus.org/advblock.txt",
-            ] {
-                match crate::net::Client.send(&Request::new("GET", url)) {
-                    Ok(r) if r.status == 200 => all.push_str(&String::from_utf8_lossy(&r.body)),
-                    Ok(r) => errors.push(format!("{url}: {}", r.status)),
-                    Err(e) => errors.push(format!("{url}: {e}")),
-                }
-            }
-            let result = if all.is_empty() { Err(errors.join("; ")) } else { Ok(all) };
-            if let Ok(mut f) = slot.lock() {
-                *f = Some(result);
-            }
-        });
-    }
-}
-
 fn remote_tabs(ui: &mut Ui, shell: &mut Shell, actions: &mut Vec<Action>) {
     let devices = shell.profile.remote_tabs();
     if devices.is_empty() {
@@ -1000,7 +648,7 @@ fn remote_tabs(ui: &mut Ui, shell: &mut Shell, actions: &mut Vec<Action>) {
     for d in devices {
         ui.label(RichText::new(format!("{} · {}", d.device, when(d.hlc.wall))).strong());
         for t in &d.tabs {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 if ui.small_button("×").on_hover_text("Закрыть на том устройстве").clicked() {
                     let _ = shell.profile.replica.close_remote_tab(&d.device, &t.id, now_ms());
                 }
@@ -1027,7 +675,7 @@ fn sync_panel(ui: &mut Ui, shell: &mut Shell, actions: &mut Vec<Action>) {
         ui.label(RichText::new(&shell.sync.status).small());
     }
     if active.is_some() {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if ui.add_enabled(shell.syncer.busy == 0, egui::Button::new("Синхронизировать")).clicked() {
                 actions.push(Action::SyncNow(None));
             }
@@ -1035,7 +683,7 @@ fn sync_panel(ui: &mut Ui, shell: &mut Shell, actions: &mut Vec<Action>) {
                 shell.sync_off();
             }
         });
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.add(egui::TextEdit::singleline(&mut shell.sync.label).hint_text("подпись точки").desired_width(170.0));
             if ui.add_enabled(shell.syncer.busy == 0, egui::Button::new("С меткой")).on_hover_text(if active.as_ref().is_some_and(|a| a.provider.is_git()) {
                 "Синхронизировать и поставить тег obsos-дата-подпись: к нему можно откатиться"
@@ -1046,7 +694,7 @@ fn sync_panel(ui: &mut Ui, shell: &mut Shell, actions: &mut Vec<Action>) {
             }
         });
         ui.checkbox(&mut shell.profile.settings.sync_auto, "Синхронизировать само");
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label("каждые");
             ui.add(egui::DragValue::new(&mut shell.profile.settings.sync_every_min).range(1..=1440).suffix(" мин"));
         });
@@ -1061,7 +709,7 @@ fn sync_panel(ui: &mut Ui, shell: &mut Shell, actions: &mut Vec<Action>) {
             ui.label(RichText::new("Пока нет — «С меткой» создаёт точку.").small());
         }
         for point in points.iter().take(50) {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 if ui.small_button("откатить").on_hover_text("Вернуть закладки, историю, оформление и пароли к этой точке").clicked() {
                     shell.modal = Some(Modal::Rollback(point.name.clone()));
                 }
@@ -1150,154 +798,13 @@ fn sync_panel(ui: &mut Ui, shell: &mut Shell, actions: &mut Vec<Action>) {
     } else {
         "Не задан: пароли синхронизируются, но прочитать их может только это устройство. Задайте один и тот же пароль на всех устройствах."
     }).small());
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         ui.add(egui::TextEdit::singleline(&mut shell.sync.sync_password).password(true).hint_text("пароль синхронизации").desired_width(200.0));
         if ui.button("Задать").clicked() {
             shell.set_sync_password();
         }
     });
     ui.label(RichText::new(format!("Это устройство: {} ({})", shell.profile.settings.device_name, shell.profile.settings.device)).small());
-}
-
-fn color_row(ui: &mut Ui, label: &str, rgb: &mut Rgb) -> bool {
-    let mut arr = [rgb.0, rgb.1, rgb.2];
-    let changed = ui.horizontal(|ui| {
-        let r = ui.color_edit_button_srgb(&mut arr).changed();
-        ui.label(label);
-        r
-    }).inner;
-    if changed {
-        *rgb = Rgb(arr[0], arr[1], arr[2]);
-    }
-    changed
-}
-
-fn looks(ui: &mut Ui, shell: &mut Shell) {
-    let mut look = shell.profile.settings.look.clone();
-    let before = look.clone();
-    ui.label(RichText::new("Сохранённые оформления").strong());
-    let saved = shell.profile.settings.looks.clone();
-    let mut delete = None;
-    for l in &saved {
-        ui.horizontal(|ui| {
-            let (r, _) = ui.allocate_exact_size(vec2(36.0, 16.0), Sense::hover());
-            ui.painter().rect_filled(Rect::from_min_size(r.min, vec2(12.0, 16.0)), 3.0, c(l.sidebar));
-            ui.painter().rect_filled(Rect::from_min_size(r.min + vec2(12.0, 0.0), vec2(12.0, 16.0)), 3.0, c(l.accent));
-            ui.painter().rect_filled(Rect::from_min_size(r.min + vec2(24.0, 0.0), vec2(12.0, 16.0)), 3.0, c(l.accent2));
-            if ui.selectable_label(l.name == look.name, &l.name).clicked() {
-                look = l.clone();
-            }
-            if saved.len() > 1 && ui.small_button("×").clicked() {
-                delete = Some(l.name.clone());
-            }
-        });
-    }
-    if let Some(name) = delete {
-        shell.profile.delete_look(&name);
-    }
-    ui.separator();
-    ui.horizontal(|ui| {
-        if ui.selectable_label(look.dark, "Тёмная основа").clicked() && !look.dark {
-            look = Look { name: look.name.clone(), ..Look::dark() };
-        }
-        if ui.selectable_label(!look.dark, "Светлая основа").clicked() && look.dark {
-            look = Look { name: look.name.clone(), ..Look::light() };
-        }
-    });
-    ui.label(RichText::new("Палитра — каждый цвет свой").strong());
-    color_row(ui, "Акцент", &mut look.accent);
-    color_row(ui, "Второй акцент", &mut look.accent2);
-    color_row(ui, "Боковая панель", &mut look.sidebar);
-    color_row(ui, "Панель адреса", &mut look.toolbar);
-    color_row(ui, "Текст", &mut look.text);
-    ui.label(RichText::new("Куда заходит акцент").strong());
-    ui.radio_value(&mut look.accent_reach, 0, "только выделение");
-    ui.radio_value(&mut look.accent_reach, 1, "и активная вкладка");
-    ui.radio_value(&mut look.accent_reach, 2, "и кнопки");
-    ui.label(RichText::new("Раскладка").strong());
-    ui.radio_value(&mut look.side_tabs, true, "вкладки сбоку (как Zervo)");
-    ui.radio_value(&mut look.side_tabs, false, "вкладки сверху");
-    if look.side_tabs {
-        ui.add(egui::Slider::new(&mut look.sidebar_width, 160..=420).text("ширина панели"));
-    }
-    ui.checkbox(&mut look.compact, "Плотнее (ниже панель адреса)");
-    ui.separator();
-    ui.horizontal(|ui| {
-        ui.add(egui::TextEdit::singleline(&mut look.name).desired_width(160.0));
-        if ui.button("Сохранить под этим именем").clicked() {
-            shell.profile.save_look(&look);
-            shell.toast(format!("Оформление «{}» сохранено и уйдёт на другие устройства", look.name));
-        }
-    });
-    if look != before {
-        shell.profile.settings.look = look;
-        shell.profile.save_settings();
-    }
-}
-
-fn settings(ui: &mut Ui, shell: &mut Shell, actions: &mut Vec<Action>) {
-    let dir = shell.delegate.downloads.dir.borrow().display().to_string();
-    let s = &mut shell.profile.settings;
-    let before = (s.search, s.home.clone());
-    ui.label(RichText::new("Поиск").strong());
-    egui::ComboBox::from_id_salt("search").selected_text(s.search.title()).show_ui(ui, |ui| {
-        for e in Search::ALL {
-            ui.selectable_value(&mut s.search, e, e.title());
-        }
-    });
-    ui.label(RichText::new("Домашняя страница").strong());
-    ui.add(egui::TextEdit::singleline(&mut s.home).desired_width(f32::INFINITY));
-    ui.checkbox(&mut s.restore_session, "Открывать вкладки прошлого сеанса");
-    ui.horizontal(|ui| {
-        ui.label("Хранить историю");
-        ui.add(egui::DragValue::new(&mut s.history_days).range(1..=3650).suffix(" дн."));
-    });
-    ui.label(RichText::new("Имя устройства").strong());
-    ui.add(egui::TextEdit::singleline(&mut s.device_name).desired_width(f32::INFINITY));
-    ui.label(RichText::new("Реклама и трекеры").strong());
-    if ui.checkbox(&mut s.block_ads, "Блокировать рекламу и трекеры").changed() {
-        shell.delegate.blocker.borrow_mut().enabled = s.block_ads;
-    }
-    ui.label(RichText::new("Загрузки").strong());
-    ui.horizontal(|ui| {
-        ui.label(RichText::new(format!("Папка: {dir}")).small());
-        if ui.small_button("Изменить…").clicked() {
-            actions.push(Action::ChooseDownloadDir);
-        }
-        if !s.download_dir.is_empty() && ui.small_button("Как было").clicked() {
-            s.download_dir.clear();
-        }
-    });
-    ui.checkbox(&mut s.download_ask, "Спрашивать, куда сохранять каждый файл");
-    let after = (s.search, s.home.clone());
-    if after != before {
-        let (search, home) = after;
-        shell.profile.put_shared("search", search.id());
-        shell.profile.put_shared("home", &home);
-        shell.update_page_data();
-    }
-    shell.profile.save_settings();
-    shell.apply_download_settings();
-    blocker_lists(ui, shell);
-    ui.separator();
-    ui.label(RichText::new("Мастер-пароль хранилища").strong());
-    let has = shell.vault.as_ref().is_some_and(|v| v.has_master_password());
-    ui.label(RichText::new(if has { "Задан: при запуске OBSOS спросит его." } else { "Не задан: хранилище открыто ключом устройства." }).small());
-    ui.horizontal(|ui| {
-        ui.add(egui::TextEdit::singleline(&mut shell.new_profile).password(true).hint_text("новый мастер-пароль").desired_width(180.0));
-        if ui.button(if has { "Сменить" } else { "Задать" }).clicked() {
-            if let Some(v) = shell.vault.as_mut() {
-                v.set_master(&shell.new_profile);
-            }
-            shell.new_profile.clear();
-            shell.toast("Мастер-пароль сохранён");
-        }
-        if has && ui.button("Снять").clicked() {
-            if let Some(v) = shell.vault.as_mut() {
-                v.set_master("");
-            }
-        }
-    });
 }
 
 fn scripts(ui: &mut Ui, shell: &mut Shell) {
@@ -1314,7 +821,7 @@ fn scripts(ui: &mut Ui, shell: &mut Shell) {
     for path in files {
         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         let enabled = name.ends_with(".js") || name.ends_with(".css");
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             let mut on = enabled;
             if ui.checkbox(&mut on, &name).changed() {
                 let target = if on { path.with_extension("") } else { path.with_extension(format!("{}.off", path.extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or_default())) };
@@ -1335,7 +842,7 @@ fn scripts(ui: &mut Ui, shell: &mut Shell) {
 pub fn open_download(path: &std::path::Path, actions: &mut Vec<Action>) {
     let shown = path.display().to_string();
     let lower = shown.to_ascii_lowercase();
-    println!("browser: open download {shown}");
+    println!("browser: open download {}", crate::logs::text(&shown));
     if crate::pages::viewable_path(&shown) {
         actions.push(Action::NewTabUrl(crate::pages::view_url(&shown).to_string()));
     } else if [".html", ".htm", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp"].iter().any(|e| lower.ends_with(e)) {
@@ -1357,7 +864,7 @@ pub fn show_in_folder(path: &std::path::Path) {
 }
 
 /// Строка состояния загрузки: «37% · 12,3 МБ из 1,0 ГБ · 5,1 МБ/с · ещё 2 мин».
-fn download_status(item: &crate::downloads::Item) -> String {
+pub(crate) fn download_status(item: &crate::downloads::Item) -> String {
     use crate::downloads::{State, human_size, human_time};
     match &item.state {
         State::Running => {
@@ -1409,8 +916,8 @@ fn downloads_bar(ctx: &egui::Context, shell: &mut Shell, rect: Rect, p: &Palette
         for item in items.iter().rev().take(fit) {
             let (chip, resp) = ui.allocate_exact_size(vec2(chip_w, r.height() - 12.0), Sense::click());
             let hovered = resp.hovered();
-            ui.painter().rect_filled(chip, 8.0, if hovered { p.hover } else { mix(p.toolbar, p.sidebar, 0.5) });
-            ui.painter().rect_stroke(chip, 8.0, Stroke::new(1.0_f32, mix(p.toolbar, p.text, 0.12)), egui::StrokeKind::Inside);
+            ui.painter().rect_filled(chip, 4.0, if hovered { p.hover } else { mix(p.toolbar, p.sidebar, 0.5) });
+            ui.painter().rect_stroke(chip, 4.0, Stroke::new(1.0_f32, mix(p.toolbar, p.text, 0.12)), egui::StrokeKind::Inside);
             // Кольцо хода слева (как в Chrome): доля — дугой.
             let ring = pos2(chip.left() + 20.0, chip.center().y);
             let color = match item.state {
@@ -1452,13 +959,13 @@ fn downloads_bar(ctx: &egui::Context, shell: &mut Shell, rect: Rect, p: &Palette
             let btn = Rect::from_center_size(pos2(chip.right() - 18.0, chip.center().y), vec2(26.0, 26.0));
             let btn_resp = ui.interact(btn, ui.id().with(("dl-btn", item.id)), Sense::click());
             if btn_resp.hovered() {
-                ui.painter().rect_filled(btn, 6.0, mix(p.hover, p.text, 0.1));
+                ui.painter().rect_filled(btn, 3.0, mix(p.hover, p.text, 0.1));
             }
             match &item.state {
                 State::Running | State::Asking => {
                     paint_icon(ui.painter(), btn, Icon::Close, p.text);
                     if btn_resp.on_hover_text("Отменить").clicked() {
-                        println!("browser: download cancel {}", item.name);
+                        println!("browser: download cancel {}", crate::logs::text(&item.name));
                         shell.delegate.downloads.cancel(item.id);
                     }
                 }
@@ -1496,97 +1003,11 @@ fn downloads_bar(ctx: &egui::Context, shell: &mut Shell, rect: Rect, p: &Palette
 }
 
 /// Значок папки (кнопка «Показать в папке»).
-fn paint_folder(painter: &egui::Painter, rect: Rect, color: Color32) {
+pub(crate) fn paint_folder(painter: &egui::Painter, rect: Rect, color: Color32) {
     let c = rect.center();
     let s = Stroke::new(1.6_f32, color);
     let pts = vec![c + vec2(-7.0, -5.0), c + vec2(-2.0, -5.0), c + vec2(0.0, -3.0), c + vec2(7.0, -3.0), c + vec2(7.0, 5.0), c + vec2(-7.0, 5.0)];
     painter.add(egui::Shape::closed_line(pts, s));
-}
-
-fn downloads(ui: &mut Ui, shell: &mut Shell, actions: &mut Vec<Action>) {
-    use crate::downloads::{State, human_size};
-    let dir = shell.delegate.downloads.dir.borrow().clone();
-    ui.label(RichText::new(format!("Папка: {} («Загрузки» в «Файлах»)", dir.display())).small());
-    ui.horizontal(|ui| {
-        if ui.button("Открыть папку").clicked() {
-            let _ = std::fs::create_dir_all(&dir);
-            crate::window::show_in_folder(&dir);
-        }
-        if ui.button("Очистить список").clicked() {
-            shell.delegate.downloads.clear_finished();
-        }
-        if ui.button("Изменить папку…").clicked() {
-            actions.push(Action::ChooseDownloadDir);
-        }
-    });
-    let mut ask = shell.profile.settings.download_ask;
-    if ui.checkbox(&mut ask, "Спрашивать, куда сохранять каждый файл").changed() {
-        shell.profile.settings.download_ask = ask;
-        shell.profile.save_settings();
-        shell.apply_download_settings();
-    }
-    ui.horizontal(|ui| {
-        ui.add(egui::TextEdit::singleline(&mut shell.filter).hint_text("адрес файла").desired_width(240.0));
-        if ui.button("Скачать").clicked() && shell.filter.trim().starts_with("http") {
-            actions.push(Action::Download(shell.filter.trim().to_string()));
-            shell.filter.clear();
-        }
-    });
-    ui.separator();
-    let items = shell.delegate.downloads.snapshot();
-    if items.is_empty() {
-        ui.label("Загрузок пока нет. Ссылки на архивы, программы, образы и файлы, которые сервер велит сохранить, скачиваются сюда; правая кнопка на ссылке — «Сохранить ссылку как…».");
-    }
-    if items.iter().any(|d| d.active()) {
-        ui.ctx().request_repaint_after(std::time::Duration::from_millis(300));
-    }
-    for item in items.iter().rev() {
-        ui.group(|ui| {
-            ui.set_width(ui.available_width());
-            ui.label(RichText::new(&item.name).strong());
-            match &item.state {
-                State::Running | State::Asking | State::Probing | State::Page => {
-                    let fraction = item.fraction();
-                    ui.add(egui::ProgressBar::new(fraction.unwrap_or(0.0)).text(download_status(item)).animate(fraction.is_none()));
-                    if ui.small_button("Отменить").clicked() {
-                        shell.delegate.downloads.cancel(item.id);
-                    }
-                }
-                State::Done(path) => {
-                    ui.label(RichText::new(format!("готово · {} · {}", human_size(item.got), path.display())).small());
-                    if let Some(sha) = &item.sha256 {
-                        ui.label(RichText::new(format!("SHA-256 {sha}")).small().weak().monospace());
-                    }
-                    ui.horizontal(|ui| {
-                        if ui.small_button("Открыть").clicked() {
-                            open_download(path, actions);
-                        }
-                        if ui.small_button("Показать в папке").clicked() {
-                            show_in_folder(path);
-                        }
-                        if ui.small_button("Скачать снова").clicked() {
-                            actions.push(Action::Download(item.url.clone()));
-                        }
-                        if ui.small_button("Убрать").clicked() {
-                            shell.delegate.downloads.remove(item.id);
-                        }
-                    });
-                }
-                State::Failed(_) | State::Cancelled => {
-                    ui.colored_label(Color32::from_rgb(0xe0, 0x70, 0x60), download_status(item));
-                    ui.horizontal(|ui| {
-                        if ui.small_button("Повторить").clicked() {
-                            actions.push(Action::Download(item.url.clone()));
-                        }
-                        if ui.small_button("Убрать").clicked() {
-                            shell.delegate.downloads.remove(item.id);
-                        }
-                    });
-                }
-            }
-            ui.label(RichText::new(clip(&item.url, 60)).small().weak());
-        });
-    }
 }
 
 fn profiles(ui: &mut Ui, shell: &mut Shell) {
@@ -1598,14 +1019,14 @@ fn profiles(ui: &mut Ui, shell: &mut Shell) {
         crate::window::new_window(&["--private"]);
     }
     for name in crate::profile::Profile::list() {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label(if name == shell.profile.name { format!("● {name} (открыт)") } else { name.clone() });
             if name != shell.profile.name && ui.small_button("открыть").clicked() {
                 crate::window::new_window(&["--profile", &name]);
             }
         });
     }
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         ui.add(egui::TextEdit::singleline(&mut shell.new_profile).hint_text("имя нового профиля").desired_width(180.0));
         if ui.button("Создать и открыть").clicked() && !shell.new_profile.trim().is_empty() {
             let name: String = shell.new_profile.chars().filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_').collect();
@@ -1617,9 +1038,39 @@ fn profiles(ui: &mut Ui, shell: &mut Shell) {
 
 // ── Диалоги ─────────────────────────────────────────────────────────────────
 
+/// Пункты контекстного меню, которые Servo отдаёт по-английски.
+fn translate(label: &str) -> &str {
+    match label {
+        "Cut" => "Вырезать",
+        "Copy" => "Копировать",
+        "Paste" => "Вставить",
+        "Select All" => "Выделить всё",
+        "Back" => "Назад",
+        "Forward" => "Вперёд",
+        "Reload" => "Обновить",
+        "Copy Link" | "Copy Link Address" => "Копировать адрес ссылки (из страницы)",
+        "Open Link in New View" | "Open Link in New Tab" => "Открыть ссылку в новой вкладке (движок)",
+        "Copy Image Link" | "Copy Image Address" => "Копировать адрес картинки (движок)",
+        "Open Image in New View" | "Open Image in New Tab" => "Открыть картинку (движок)",
+        "Undo" => "Отменить",
+        "Redo" => "Повторить",
+        "Delete" => "Удалить",
+        other => other,
+    }
+}
+
 fn modal(ctx: &egui::Context, shell: &mut Shell, page: Rect, p: &Palette, actions: &mut Vec<Action>) {
     let Some(m) = shell.modal.take() else { return };
     let mut put_back: Option<Modal> = None;
+    // Esc закрывает меню и список страницы.
+    if matches!(m, Modal::Select(..) | Modal::Context(..)) && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        match m {
+            Modal::Select(select, _) => select.submit(),
+            Modal::Context(menu, _) => menu.dismiss(),
+            _ => {}
+        }
+        return;
+    }
     // Затемнение страницы — щелчок мимо закрывает меню и списки.
     let backdrop = egui::Area::new(egui::Id::new("obsos-backdrop")).order(egui::Order::Foreground).fixed_pos(page.min).show(ctx, |ui| {
         let (r, resp) = ui.allocate_exact_size(page.size(), Sense::click());
@@ -1750,21 +1201,37 @@ fn modal(ctx: &egui::Context, shell: &mut Shell, page: Rect, p: &Palette, action
         Modal::Context(menu, at) => {
             let mut chosen = None;
             let mut save: Option<String> = None;
+            let mut extra: Option<Action> = None;
             let info = menu.element_info().clone();
             let link = info.link_url.filter(|u| matches!(u.scheme(), "http" | "https")).map(|u| u.to_string());
             let image = info.image_url.filter(|u| matches!(u.scheme(), "http" | "https")).map(|u| u.to_string());
             egui::Area::new(egui::Id::new("obsos-context")).order(egui::Order::Tooltip).fixed_pos(at).show(ctx, |ui| {
                 egui::Frame::popup(&ctx.global_style()).fill(p.sidebar).show(ui, |ui| {
                     ui.set_min_width(200.0);
-                    // Свои пункты (Servo их не знает): сохранить ссылку или
-                    // картинку через окно «Сохранить как».
+                    // Свои пункты (Servo их не знает): ссылка и картинка —
+                    // в новую вкладку, копировать, сохранить как.
+                    let entry = |ui: &mut Ui, text: &str| ui.add(egui::Button::new(text).frame(false)).clicked();
                     if let Some(url) = &link {
-                        if ui.add(egui::Button::new("Сохранить ссылку как…").frame(false)).clicked() {
+                        if entry(ui, "Открыть ссылку в новой вкладке") {
+                            extra = Some(Action::OpenBackground(url.clone()));
+                        }
+                        if entry(ui, "Копировать адрес ссылки") {
+                            crate::window::clipboard_set(url);
+                            extra = Some(Action::Toast("Адрес ссылки скопирован"));
+                        }
+                        if entry(ui, "Сохранить ссылку как…") {
                             save = Some(url.clone());
                         }
                     }
                     if let Some(url) = &image {
-                        if ui.add(egui::Button::new("Сохранить картинку как…").frame(false)).clicked() {
+                        if entry(ui, "Открыть картинку в новой вкладке") {
+                            extra = Some(Action::OpenBackground(url.clone()));
+                        }
+                        if entry(ui, "Копировать адрес картинки") {
+                            crate::window::clipboard_set(url);
+                            extra = Some(Action::Toast("Адрес картинки скопирован"));
+                        }
+                        if entry(ui, "Сохранить картинку как…") {
                             save = Some(url.clone());
                         }
                     }
@@ -1774,7 +1241,7 @@ fn modal(ctx: &egui::Context, shell: &mut Shell, page: Rect, p: &Palette, action
                     for item in menu.items() {
                         match item {
                             ContextMenuItem::Item { label, action, enabled } => {
-                                if ui.add_enabled(*enabled, egui::Button::new(label).frame(false)).clicked() {
+                                if ui.add_enabled(*enabled, egui::Button::new(translate(label)).frame(false)).clicked() {
                                     chosen = Some(*action);
                                 }
                             }
@@ -1783,10 +1250,17 @@ fn modal(ctx: &egui::Context, shell: &mut Shell, page: Rect, p: &Palette, action
                             }
                         }
                     }
+                    ui.separator();
+                    if ui.add(egui::Button::new("Просмотреть код").frame(false)).clicked() {
+                        extra = Some(Action::InspectAt(at.x, at.y));
+                    }
                 });
             });
-            if let Some(url) = save {
-                println!("browser: context save as {url}");
+            if let Some(action) = extra {
+                menu.dismiss();
+                actions.push(action);
+            } else if let Some(url) = save {
+                println!("browser: context save as {}", crate::logs::url(&url));
                 menu.dismiss();
                 actions.push(Action::SaveAs(url));
             } else if let Some(action) = chosen {

@@ -186,8 +186,10 @@ impl Http for Client {
                 let scheme_host = &current.url[..current.url.find("://").map(|i| i + 3).unwrap_or(0) + host_of(&current.url).len()];
                 format!("{scheme_host}{}", if location.starts_with('/') { location.to_string() } else { format!("/{location}") })
             };
-            if host_of(&next) != host_of(&current.url) {
-                current.headers.retain(|(k, _)| !k.eq_ignore_ascii_case("authorization"));
+            // Другой сайт или уход с https — ни пароля, ни кук.
+            let downgrade = current.url.starts_with("https://") && !next.starts_with("https://");
+            if downgrade || host_of(&next) != host_of(&current.url) {
+                current.headers.retain(|(k, _)| !k.eq_ignore_ascii_case("authorization") && !k.eq_ignore_ascii_case("cookie"));
             }
             if response.status == 303 || (matches!(response.status, 301 | 302) && current.method == "POST") {
                 current.method = String::from("GET");
@@ -352,7 +354,9 @@ pub fn open(url: &str, cookie: Option<&str>, referer: Option<&str>) -> Result<Op
             target.path,
             if (target.tls && target.port == 443) || (!target.tls && target.port == 80) { target.host.clone() } else { format!("{}:{}", target.host, target.port) }
         );
-        if let Some(c) = cookie.filter(|c| !c.is_empty() && host_of(&current) == first_host) {
+        // Куки — только тому же сайту и без ухода с https.
+        let downgrade = url.starts_with("https://") && !current.starts_with("https://");
+        if let Some(c) = cookie.filter(|c| !c.is_empty() && !downgrade && host_of(&current) == first_host) {
             head.push_str(&format!("Cookie: {c}\r\n"));
         }
         if let Some(r) = referer.filter(|r| r.starts_with("http")) {

@@ -41,6 +41,42 @@ pub fn renderer_name() -> String {
 /// высота). Окно копирует их на свою поверхность.
 pub type PresentHook = Box<dyn Fn(&[u8], u32, u32)>;
 
+/// Контекст рисования страниц OBSOS: программный (здесь) или видеокартой
+/// (`gpu_ctx`).
+pub trait PageContext: RenderingContext {
+    fn set_present_hook(&self, hook: PresentHook);
+}
+
+/// Таймер кадров анимаций: у Servo по умолчанию 120 Гц — вдвое больше работы,
+/// чем показывает обычный экран, а программному рисованию и 60 много.
+pub struct Pacer(std::sync::mpsc::Sender<Box<dyn Fn() + Send + 'static>>);
+
+impl Pacer {
+    pub fn new(fps: u32) -> Rc<Pacer> {
+        use std::time::{Duration, Instant};
+        let (tx, rx) = std::sync::mpsc::channel::<Box<dyn Fn() + Send + 'static>>();
+        let frame = Duration::from_secs(1) / fps.max(1);
+        let _ = std::thread::Builder::new().name(String::from("obsos-vsync")).spawn(move || {
+            let mut next = Instant::now();
+            while let Ok(first) = rx.recv() {
+                next = (next + frame).max(Instant::now());
+                std::thread::sleep(next.saturating_duration_since(Instant::now()));
+                first();
+                while let Ok(callback) = rx.try_recv() {
+                    callback();
+                }
+            }
+        });
+        Rc::new(Pacer(tx))
+    }
+}
+
+impl servo::RefreshDriver for Pacer {
+    fn observe_next_frame(&self, callback: Box<dyn Fn() + Send + 'static>) {
+        let _ = self.0.send(callback);
+    }
+}
+
 pub struct SwglRenderingContext {
     ctx: swgl::Context,
     gl: Rc<dyn Gl>,
@@ -49,6 +85,13 @@ pub struct SwglRenderingContext {
     /// Кадр: BGRA, строка — ширина × 4, строки снизу вверх (порядок GL).
     frame: RefCell<Vec<u8>>,
     present_hook: RefCell<Option<PresentHook>>,
+    refresh: Rc<Pacer>,
+}
+
+impl PageContext for SwglRenderingContext {
+    fn set_present_hook(&self, hook: PresentHook) {
+        *self.present_hook.borrow_mut() = Some(hook);
+    }
 }
 
 impl SwglRenderingContext {
@@ -64,13 +107,10 @@ impl SwglRenderingContext {
             size: Cell::new(size),
             frame: RefCell::new(Vec::new()),
             present_hook: RefCell::new(None),
+            refresh: Pacer::new(40),
         };
         this.realloc(size);
         Rc::new(this)
-    }
-
-    pub fn set_present_hook(&self, hook: PresentHook) {
-        *self.present_hook.borrow_mut() = Some(hook);
     }
 
     fn realloc(&self, size: PhysicalSize<u32>) {
@@ -145,6 +185,10 @@ impl RenderingContext for SwglRenderingContext {
     fn glow_gl_api(&self) -> Arc<glow::Context> {
         self.glow.clone()
     }
+
+    fn refresh_driver(&self) -> Option<Rc<dyn servo::RefreshDriver>> {
+        Some(self.refresh.clone())
+    }
 }
 
 /// Каталоги Servo (08.11.2026): профиль — `<дом>/.config/servo` (хранилище
@@ -190,5 +234,21 @@ pub fn preferences() -> servo::Preferences {
     prefs.layout_css_container_queries_enabled = true;
     prefs.layout_css_columns_enabled = true;
     prefs.layout_css_font_variations_enabled = true;
+    // Дальше — только настольным системам: на FossAi это не проверялось.
+    if cfg!(target_os = "freeos") {
+        return prefs;
+    }
+    // Нужны редакторам, веб-приложениям и загрузчикам шрифтов.
+    prefs.dom_fontface_enabled = true;
+    prefs.dom_exec_command_enabled = true;
+    prefs.dom_async_clipboard_enabled = true;
+    prefs.dom_offscreen_canvas_enabled = true;
+    // Холст под страницей белый (по умолчанию — прозрачный, а окно
+    // прозрачности не показывает: незакрашенное выходило чёрным).
+    prefs.shell_background_color_rgba = [1.0, 1.0, 1.0, 1.0];
+    // Вёрстка и фоновые задачи в несколько потоков: процессоров обычно много
+    // (по умолчанию у Servo 3 и 4).
+    prefs.layout_threads = -1;
+    prefs.thread_pool_workers_max = 8;
     prefs
 }

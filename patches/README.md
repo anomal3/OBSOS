@@ -24,9 +24,12 @@ Servo берётся с crates.io (`servo = "=0.8.0"`, та же версия и
 | Крейт | Правка | Где действует |
 |---|---|---|
 | servo-script | без потоковой компиляции WebAssembly (`compileStreaming` терял начало тела — Blazor на web.pynop.online не запускался) | везде |
+| servo-paint | участок общего буфера на вкладку (`obsos::VIEWPORTS`) — несколько окон без перезагрузки страницы при переносе | везде |
+| servo-script | `<style>`, добавленный в shadow root позже элементов, начинает действовать (плеер vkvideo.ru без оформления) | везде |
+| servo-script | IndexedDB: транзакция не завершается дважды (паника «clear_upgrade_transaction…» роняла браузер при входе в Rupor) | везде |
 | servo-script | `navigator.platform` = «Linux» | FossAi |
 | servo-net | только HTTP/1.1 (потоки HTTP/2 к CDN повисали) | FossAi |
-| servo-paint | очистка кэша WebRender без `DepthFunc(ALWAYS)`, без дизеринга (swgl их не умеет; OBSOS рисует swgl везде) | везде |
+| servo-paint | очистка кэша WebRender без `DepthFunc(ALWAYS)`, без дизеринга — только когда рисует swgl (по имени рендерера); с видеокартой — как в Servo | везде |
 | servo-storage | SQLite без WAL (нет общей памяти `-shm`): localStorage/IndexedDB | FossAi |
 | servo-fonts, servo-fonts-traits | FreeType и свой список шрифтов (`fonts/font_list.rs`) | FossAi |
 | gaol | пустой крейт (песочница нужна только `multiprocess`) | везде (не используется) |
