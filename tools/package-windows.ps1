@@ -40,7 +40,7 @@ New-Item -ItemType Directory -Force $stage | Out-Null
 
 # Плагины, которые Servo ищет рядом с программой.
 $cargo = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { "$env:USERPROFILE\.cargo" }
-$plugins = @(Get-ChildItem "$cargo\registry\src\*\servo-0.8.0\gstreamer_plugin_lists\*" |
+$plugins = @(Get-ChildItem (Join-Path $repo 'vendor\servo-0.8.0\gstreamer_plugin_lists\*') |
     Where-Object { $_.Name -in 'common.rs.in', 'windows.rs.in' } |
     ForEach-Object { [regex]::Matches((Get-Content $_.FullName -Raw), '"([^"]+)"') | ForEach-Object { "$($_.Groups[1].Value).dll" } } |
     Sort-Object -Unique)
@@ -95,7 +95,8 @@ OBSOS $version — браузер на движке Servo (Windows x64, ранн
 Профиль и настройки: %USERPROFILE%\.config\obsos
 Журнал:              %USERPROFILE%\.config\obsos\obsos.log
 
-Чего нет: потокового видео MSE (YouTube), WebGL. Движок Servo молодой —
+Чего нет: потокового видео MSE (YouTube). Звонки сырые: соединяются, но
+звук пока может быть не слышен (TODO.md в репозитории). Движок Servo молодой —
 часть сайтов выглядит или работает не так, как в Chrome и Firefox.
 
 Лицензии: свой код OBSOS — MIT или Apache-2.0; сторонние компоненты

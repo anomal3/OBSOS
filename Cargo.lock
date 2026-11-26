@@ -4488,6 +4488,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "mozangle"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d5892d91814b6681a2406067efec53abe9ba4fe8748dcd99e4f5a96a99a05ac0"
+dependencies = [
+ "bindgen",
+ "cc",
+ "walkdir",
+]
+
+[[package]]
 name = "mozjs"
 version = "0.26.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5254,7 +5265,7 @@ dependencies = [
 
 [[package]]
 name = "obsos-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "argon2",
  "browser-sync",
@@ -5277,6 +5288,7 @@ dependencies = [
  "servo-paint",
  "sha1 0.10.7",
  "sha2 0.10.9",
+ "stylo_static_prefs",
  "surfman",
  "swgl",
  "url",
@@ -5285,7 +5297,7 @@ dependencies = [
 
 [[package]]
 name = "obsos-desktop"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "arboard",
  "chrono",
@@ -5300,7 +5312,7 @@ dependencies = [
 
 [[package]]
 name = "obsos-fossai"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "dpi",
  "euclid",
@@ -6903,8 +6915,6 @@ dependencies = [
 [[package]]
 name = "servo"
 version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "58a502704ce2fee976f20ee6192c575a3a77dfe844431f83cd4946da6e524985"
 dependencies = [
  "accesskit",
  "bitflags 2.13.2",
@@ -6955,6 +6965,7 @@ dependencies = [
  "servo-tracing",
  "servo-url",
  "servo-wakelock",
+ "servo-webgl",
  "stylo",
  "stylo_traits",
  "surfman",
@@ -7428,8 +7439,6 @@ dependencies = [
 [[package]]
 name = "servo-layout"
 version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "02047fd51cca1b92cfd38bc4663c9f11f6ebf99cd2d5550bac507a0a2b77addc"
 dependencies = [
  "accesskit",
  "app_units",
@@ -7647,8 +7656,6 @@ dependencies = [
 [[package]]
 name = "servo-media-gstreamer"
 version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7bb5bc60a53436a224a57f23059a494bf84296119f1c6e8f5bbba8a2af3fa96f"
 dependencies = [
  "byte-slice-cast",
  "data-url",
@@ -7758,8 +7765,6 @@ dependencies = [
 [[package]]
 name = "servo-media-streams"
 version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6a36e094d79e768473b699e84513547521476529f5b2253dad9edf3a337dd116"
 dependencies = [
  "malloc_size_of_derive",
  "servo-malloc-size-of",
@@ -7973,6 +7978,7 @@ dependencies = [
  "servo-profile-traits",
  "servo-timers",
  "servo-tracing",
+ "servo-webgl",
  "smallvec",
  "stylo_traits",
  "surfman",
@@ -8108,6 +8114,7 @@ dependencies = [
  "markup5ever",
  "mime",
  "mime_guess",
+ "mozangle",
  "mozjs",
  "nom-rfc8288",
  "num-traits",
@@ -8181,8 +8188,6 @@ dependencies = [
 [[package]]
 name = "servo-script-bindings"
 version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "75f9bbcb6eb03e96610c1cbd9e71a26869874178e4f109a9a1c3f810bce88f81"
 dependencies = [
  "atomic_refcell",
  "bitflags 2.13.2",
@@ -8406,6 +8411,31 @@ checksum = "f32ef0d1402c9c169fb10a4a4cb49c42864e2dab6f1ec2fc2026447efee835e7"
 dependencies = [
  "serde",
  "servo-embedder-traits",
+]
+
+[[package]]
+name = "servo-webgl"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "28d10b20a6a3dd77133b91fbd0e7840c582faf379ee5b870abad9429d0863aa6"
+dependencies = [
+ "bitflags 2.13.2",
+ "byteorder",
+ "crossbeam-channel",
+ "euclid",
+ "glow",
+ "half",
+ "itertools 0.15.0",
+ "log",
+ "num-traits",
+ "parking_lot",
+ "rustc-hash",
+ "servo-base",
+ "servo-canvas-traits",
+ "servo-paint-api",
+ "servo-pixels",
+ "surfman",
+ "webrender_api",
 ]
 
 [[package]]
@@ -9024,8 +9054,6 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 [[package]]
 name = "surfman"
 version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7fe194717def845ecb64e7aeda3e2108c4b3b1584a01aa6e545e702cedca2a00"
 dependencies = [
  "bitflags 2.13.2",
  "cfg_aliases",

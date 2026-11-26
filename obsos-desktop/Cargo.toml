@@ -18,8 +18,8 @@ video = ["servo/media-gstreamer"]
 [dependencies]
 obsos-core = { path = "../obsos-core" }
 # Возможности Servo только настольной сборки (на FossAi их не собираем):
-# `crypto.subtle` и сервер инструментов разработчика (Firefox).
-servo = { workspace = true, features = ["subtlecrypto", "devtools"] }
+# `crypto.subtle`, WebGL и сервер инструментов разработчика (Firefox).
+servo = { workspace = true, features = ["subtlecrypto", "devtools", "webgl"] }
 # Выбор дискретной видеокарты на ПК с двумя (`declare_surfman!`).
 surfman.workspace = true
 winit = "0.30"

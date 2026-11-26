@@ -190,6 +190,8 @@ pub enum Note {
     Fullscreen(WebViewId, bool),
     /// Сообщение агента инструментов разработчика.
     DevTools(WebViewId, String),
+    /// Страница просит микрофон или камеру.
+    Permission(WebViewId, servo::PermissionRequest),
     /// Только перерисовать оболочку (пришёл ответ страницы).
     Redraw,
 }
@@ -234,6 +236,7 @@ impl Note {
             | Note::WebUi(id, _)
             | Note::Favicon(id)
             | Note::Fullscreen(id, _)
+            | Note::Permission(id, _)
             | Note::DevTools(id, _) => Some(*id),
             Note::History | Note::HideControl(_) | Note::Action(_) | Note::Redraw => None,
         }
@@ -266,6 +269,10 @@ pub fn klog(text: &str) {
 }
 
 impl WebViewDelegate for Delegate {
+    fn request_permission(&self, webview: WebView, request: servo::PermissionRequest) {
+        self.note(Note::Permission(webview.id(), request));
+    }
+
     fn notify_new_frame_ready(&self, webview: WebView) {
         self.note(Note::Frame(webview.id()));
     }
@@ -511,6 +518,72 @@ try {
     var W = WebAssembly, body = function(src){ return Promise.resolve(src).then(function(r){ return r.arrayBuffer(); }); };
     W.instantiateStreaming = function(src, imports){ return body(src).then(function(b){ return W.instantiate(b, imports); }); };
     W.compileStreaming = function(src){ return body(src).then(function(b){ return W.compile(b); }); };
+  }
+} catch(e) {}
+// Звонки: у RTCPeerConnection в Servo есть только старый addStream. Здесь то,
+// чем пользуются сайты (Rupor: addTrack до начала звонка, e.streams[0],
+// connectionState). Смена дорожки на ходу (камера, экран) не поддерживается.
+try {
+  var PC = window.RTCPeerConnection;
+  if (PC && !PC.prototype.addTrack) {
+    // Дорожки, уже отданные звонку, плееру или AudioContext: второго получателя
+    // медиадвижок не выдерживает.
+    var taken = new Set(), proto = PC.prototype, handlers = new WeakMap();
+    var take = function(stream){ if (stream && stream.getTracks) stream.getTracks().forEach(function(t){ taken.add(t.id); }); };
+    proto.addTrack = function(track){
+      var list = this.__obsosSenders || (this.__obsosSenders = []);
+      if (list.some(function(s){ return s.track === track; })) throw new DOMException('Track already added', 'InvalidAccessError');
+      taken.add(track.id);
+      this.addStream(new MediaStream([track]));
+      var sender = { track: track,
+        replaceTrack: function(){ return Promise.reject(new DOMException('replaceTrack is not supported', 'NotSupportedError')); },
+        getParameters: function(){ return { encodings: [{}] }; },
+        setParameters: function(){ return Promise.resolve(); } };
+      list.push(sender);
+      return sender;
+    };
+    proto.getSenders = function(){ return (this.__obsosSenders || []).slice(); };
+    proto.getReceivers = function(){ return []; };
+    proto.getTransceivers = function(){ return []; };
+    proto.removeTrack = function(sender){ if (sender && sender.track) sender.track.enabled = false; };
+    proto.getStats = function(){ return Promise.resolve(new Map()); };
+    proto.restartIce = function(){};
+    var states = { checking: 'connecting', connected: 'connected', completed: 'connected', disconnected: 'disconnected', failed: 'failed', closed: 'closed' };
+    Object.defineProperty(proto, 'connectionState', { configurable: true, get: function(){ return states[this.iceConnectionState] || 'new'; } });
+    Object.defineProperty(proto, 'onconnectionstatechange', { configurable: true,
+      get: function(){ return handlers.get(this) || null; },
+      set: function(f){ handlers.set(this, typeof f === 'function' ? f : null); } });
+    var Wrapped = function RTCPeerConnection(config){
+      var pc = new PC(config || {}), last = 'new';
+      pc.addEventListener('iceconnectionstatechange', function(){
+        var now = pc.connectionState;
+        if (now === last || now === 'closed') return;
+        last = now;
+        var event = new Event('connectionstatechange');
+        pc.dispatchEvent(event);
+        var f = handlers.get(pc);
+        if (f) f.call(pc, event);
+      });
+      // Этот слушатель стоит раньше `ontrack` страницы.
+      pc.addEventListener('track', function(e){
+        if (!e.streams) Object.defineProperty(e, 'streams', { value: [new MediaStream([e.track])] });
+      });
+      return pc;
+    };
+    Wrapped.prototype = proto;
+    window.RTCPeerConnection = Wrapped;
+    var source = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'srcObject');
+    if (source && source.set) Object.defineProperty(HTMLMediaElement.prototype, 'srcObject', { configurable: true, enumerable: source.enumerable,
+      get: source.get, set: function(value){ take(value); source.set.call(this, value); } });
+    if (window.AudioContext && AudioContext.prototype.createMediaStreamSource) {
+      var make = AudioContext.prototype.createMediaStreamSource;
+      AudioContext.prototype.createMediaStreamSource = function(stream){
+        if (stream && stream.getTracks && stream.getTracks().some(function(t){ return taken.has(t.id); }))
+          throw new DOMException('Stream is already in use', 'NotSupportedError');
+        take(stream);
+        return make.call(this, stream);
+      };
+    }
   }
 } catch(e) {}
 // Servo 0.8 не шлёт `change` текстовому полю, когда правку завершили (уход
@@ -980,6 +1053,18 @@ pub struct Shell {
     pub windows: crate::windows::Windows,
     /// Вкладка с новым кадром, ещё не нарисованным (`paint_pending`).
     pub frame_wanted: Option<WebView>,
+    /// Вопросы страниц о микрофоне и камере без ответа.
+    pub permissions: Vec<Permission>,
+    /// Что уже разрешено сайтам до закрытия браузера: (источник, чему).
+    pub granted: BTreeSet<(String, &'static str)>,
+}
+
+pub struct Permission {
+    pub webview: WebViewId,
+    origin: String,
+    pub host: String,
+    pub what: &'static str,
+    request: servo::PermissionRequest,
 }
 
 /// Что показывает вкладка вместо адреса, ушедшего в загрузки (пока не
@@ -1178,6 +1263,10 @@ impl Shell {
             return true;
         }
         let tab = self.tabs.remove(index);
+        // Вопрос закрытой вкладки — отказ (так отвечает и сам запрос при
+        // уничтожении).
+        let closed_view = tab.webview.id();
+        self.permissions.retain(|p| p.webview != closed_view);
         if let Some(url) = tab.real_url {
             self.closed.push(url.to_string());
             if self.closed.len() > 25 {
@@ -1351,6 +1440,7 @@ impl Shell {
                         crate::devtools::agent_message(self, &payload);
                     }
                 }
+                Note::Permission(id, request) => self.permission_asked(id, request),
                 Note::Redraw => {}
                 Note::Favicon(id) => {
                     if let Some(i) = self.tab_index(id) {
@@ -1378,6 +1468,41 @@ impl Shell {
             self.frame_wanted = Some(self.tabs[self.active].webview.clone());
         }
         changed
+    }
+
+    /// Страница ждёт разрешения (её скрипт стоит до ответа).
+    fn permission_asked(&mut self, id: WebViewId, request: servo::PermissionRequest) {
+        let what = match request.feature() {
+            servo::PermissionFeature::Microphone => "микрофону",
+            servo::PermissionFeature::Camera => "камере",
+            // Остальное (уведомления, местоположение…) пока не умеем — отказ.
+            _ => return request.deny(),
+        };
+        let url = self.tab_index(id).and_then(|i| self.tabs[i].real_url.clone());
+        let Some(url) = url else { return request.deny() };
+        let origin = url.origin().ascii_serialization();
+        if self.granted.contains(&(origin.clone(), what)) {
+            return request.allow();
+        }
+        let host = url.host_str().unwrap_or("Страница").to_string();
+        println!("browser: permission asked: {} {what}", crate::logs::url(url.as_str()));
+        self.permissions.push(Permission { webview: id, origin, host, what, request });
+    }
+
+    /// Ответ на вопрос `index` из `permissions`. Разрешённое помнится для
+    /// сайта до закрытия браузера.
+    pub fn answer_permission(&mut self, index: usize, allow: bool) {
+        if index >= self.permissions.len() {
+            return;
+        }
+        let asked = self.permissions.remove(index);
+        println!("browser: permission {}: {}", asked.what, if allow { "allowed" } else { "denied" });
+        if allow {
+            self.granted.insert((asked.origin, asked.what));
+            asked.request.allow();
+        } else {
+            asked.request.deny();
+        }
     }
 
     /// Нарисовать пришедшие кадры. Painter один на все окна, поэтому — раз

@@ -243,6 +243,9 @@ pub fn preferences() -> servo::Preferences {
     prefs.dom_exec_command_enabled = true;
     prefs.dom_async_clipboard_enabled = true;
     prefs.dom_offscreen_canvas_enabled = true;
+    // 3D-страницы (three.js и подобные требуют WebGL2). Рисуется только с
+    // видеокартой: программный вывод подключения к ней не даёт.
+    prefs.dom_webgl2_enabled = true;
     // Холст под страницей белый (по умолчанию — прозрачный, а окно
     // прозрачности не показывает: незакрашенное выходило чёрным).
     prefs.shell_background_color_rgba = [1.0, 1.0, 1.0, 1.0];

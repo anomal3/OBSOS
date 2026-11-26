@@ -731,6 +731,11 @@ pub fn run(open_window: impl FnOnce(&str, u32, u32) -> Option<Rc<Window>>) -> ! 
     // сайта к localStorage/IndexedDB на ~1,6 с — страница всё это время
     // стояла (`localStorage.setItem`).
     remove_stale_shm(&profile.servo_dir(), 0);
+    // Звонки и микрофон: движок спрашивает разрешение у оболочки.
+    if window::platform().webrtc_available() {
+        prefs.dom_webrtc_enabled = true;
+        prefs.dom_webrtc_transceiver_enabled = true;
+    }
     // Сервер инструментов разработчика Servo (Firefox: about:debugging) —
     // только по ключу `--devtools [порт]`, слушает свой компьютер.
     let devtools_port = std::env::args().skip_while(|a| a != "--devtools").nth(1).map(|p| p.parse::<u16>().unwrap_or(6080));
@@ -748,6 +753,12 @@ pub fn run(open_window: impl FnOnce(&str, u32, u32) -> Option<Rc<Window>>) -> ! 
         .build();
     if devtools_port.is_some() {
         servo.set_delegate(Rc::new(DevtoolsDelegate));
+    }
+    // Маски CSS (`mask-image`): значки рисует наша правка вёрстки Servo
+    // (patches/README.md). Переключателя в настройках Servo нет — это Stylo.
+    // На FossAi не проверялось.
+    if !cfg!(target_os = "freeos") {
+        stylo_static_prefs::set_pref!("layout.css.masking.enabled", true);
     }
     let content = content_manager(&servo, &profile);
     let delegate = Rc::new(Delegate {
@@ -812,6 +823,8 @@ pub fn run(open_window: impl FnOnce(&str, u32, u32) -> Option<Rc<Window>>) -> ! 
         renderer_name,
         windows: Default::default(),
         frame_wanted: None,
+        permissions: Vec::new(),
+        granted: Default::default(),
     };
     if gpu_failed {
         shell.profile.settings.gpu = false;

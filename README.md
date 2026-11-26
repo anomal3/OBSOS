@@ -163,8 +163,10 @@ docker run --rm -v <FossAi>:/work -v <OBSOS>:/obsos -v fossai-servo:/cache \
 * Масштаб экрана учитывается на Windows/Linux; на FossAi окно сообщает 1.
 * Видеокарта — только на Windows; на Linux и FossAi рисует процессор.
 * «Открыть в Chromium» на Windows/Linux открывает браузер системы по умолчанию.
-* Пробелы Servo 0.8: нет Media Source Extensions (YouTube), WebGL, CSS-масок
-  (часть значков — чёрными квадратами, например в Википедии).
+* Пробелы Servo 0.8: нет Media Source Extensions (YouTube). CSS-маски — только
+  значки (картинка-маска поверх сплошного цвета).
+* WebGL и звонки (WebRTC, микрофон) — только на Windows; на FossAi выключены.
+  Звонки пока сырые: соединяются, но без звука — см. [TODO.md](TODO.md).
 * Без фичи `video` (и на FossAi) `<video>` никогда не сообщает о загрузке:
   событие `load` не наступает, а некоторые страницы (github.com) падают.
 

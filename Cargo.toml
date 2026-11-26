@@ -11,7 +11,7 @@ members = [
 default-members = ["obsos-desktop"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 # Свой код OBSOS — на выбор MIT или Apache-2.0 (LICENSE-MIT, LICENSE-APACHE);
 # сторонний код — под своими лицензиями (docs/NOTICE.md).
@@ -39,6 +39,8 @@ egui_glow = { version = "0.34", default-features = false }
 raw-window-handle = "0.6"
 # Участки буфера для нескольких окон (наша правка, patches/README.md).
 servo-paint = "=0.8.0"
+# Переключатели Stylo, которых нет в настройках Servo (маски CSS).
+stylo_static_prefs = "=0.23.0"
 browser-sync = { path = "crates/browser-sync", features = ["std"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "aws-lc-rs", "logging"] }
 webpki-roots = "1"
@@ -60,8 +62,14 @@ egui_software_backend = { path = "third_party/egui-software-backend" }
 # wasm) действуют везде.
 gaol = { path = "vendor/gaol-stub" }
 servo-script = { path = "vendor/servo-script-0.8.0" }
+servo-layout = { path = "vendor/servo-layout-0.8.0" }
+surfman = { path = "vendor/surfman-0.14.0" }
 servo-net = { path = "vendor/servo-net-0.8.0" }
 servo-paint = { path = "vendor/servo-paint-0.8.0" }
+servo = { path = "vendor/servo-0.8.0" }
+servo-media-streams = { path = "vendor/servo-media-streams-0.8.0" }
+servo-media-gstreamer = { path = "vendor/servo-media-gstreamer-0.8.0" }
+servo-script-bindings = { path = "vendor/servo-script-bindings-0.8.0" }
 servo-storage = { path = "vendor/servo-storage-0.8.0" }
 servo-fonts = { path = "vendor/servo-fonts-0.8.0" }
 servo-fonts-traits = { path = "vendor/servo-fonts-traits-0.8.0" }

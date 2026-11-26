@@ -256,6 +256,11 @@ pub trait Platform: Send + Sync {
     }
     /// Есть ли внешний браузер «Открыть в Chromium».
     fn chromium_installed(&self) -> bool;
+    /// Собраны ли звук и видео (GStreamer): без них звонки (WebRTC) и
+    /// микрофон включать незачем.
+    fn webrtc_available(&self) -> bool {
+        false
+    }
     fn open_in_chromium(&self, url: &str) -> Result<i64, String>;
     /// «Сохранить как»: папка, предложенное имя.
     fn save_dialog(&self, owner: &Window, title: &str, dir: &str, name: &str) -> Result<FileDialog, String>;

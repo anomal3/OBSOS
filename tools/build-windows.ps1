@@ -79,16 +79,24 @@ $out = Join-Path $target 'release'
 if ($gst) {
     # Servo ищет плагины GStreamer рядом с программой — по своему списку.
     $cargo = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { "$env:USERPROFILE\.cargo" }
-    $lists = Get-ChildItem "$cargo\registry\src\*\servo-0.8.0\gstreamer_plugin_lists\*" -ErrorAction SilentlyContinue |
+    $lists = Get-ChildItem (Join-Path $repo 'vendor\servo-0.8.0\gstreamer_plugin_lists\*') -ErrorAction SilentlyContinue |
         Where-Object { $_.Name -in 'common.rs.in', 'windows.rs.in' }
     $plugins = @(foreach ($list in $lists) { [regex]::Matches((Get-Content $list.FullName -Raw), '"([^"]+)"') | ForEach-Object { $_.Groups[1].Value } })
     if (-not $plugins) { throw 'Не прочитан список плагинов GStreamer из крейта servo-0.8.0' }
     $copied = 0
-    foreach ($dll in Get-ChildItem "$gst\bin\*.dll") { Copy-Item $dll.FullName $out -Force; $copied++ }
+    # Такой же файл не копируется заново: библиотеку может держать запущенный
+    # OBSOS, и тогда обрывалось бы всё копирование после неё.
+    function Copy-Dll($from) {
+        $to = Join-Path $out (Split-Path $from -Leaf)
+        $a = Get-Item $from
+        $b = Get-Item $to -ErrorAction SilentlyContinue
+        if (-not $b -or $b.Length -ne $a.Length -or $b.LastWriteTimeUtc -ne $a.LastWriteTimeUtc) { Copy-Item $from $to -Force }
+    }
+    foreach ($dll in Get-ChildItem "$gst\bin\*.dll") { Copy-Dll $dll.FullName; $copied++ }
     $missing = @()
     foreach ($name in $plugins | Sort-Object -Unique) {
         $path = "$gst\lib\gstreamer-1.0\$name.dll"
-        if (Test-Path $path) { Copy-Item $path $out -Force; $copied++ } else { $missing += $name }
+        if (Test-Path $path) { Copy-Dll $path; $copied++ } else { $missing += $name }
     }
     Write-Host "DLL GStreamer рядом с программой: $copied"
     if ($missing) { Write-Host "Плагинов из списка Servo нет в этом GStreamer: $($missing -join ', ')" }

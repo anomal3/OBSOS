@@ -19,7 +19,7 @@ use dpi::PhysicalSize;
 use gleam::gl::{self, Gl};
 use raw_window_handle::{DisplayHandle, RawDisplayHandle, RawWindowHandle, WindowHandle};
 use servo::{DeviceIntRect, RefreshDriver, RenderingContext, RgbaImage, WindowRenderingContext};
-use surfman::{Error, Surface, SurfaceAccess, SurfaceType};
+use surfman::{Connection, Error, Surface, SurfaceAccess, SurfaceTexture, SurfaceType};
 
 use crate::swgl_ctx::{PageContext, PresentHook};
 
@@ -67,8 +67,9 @@ impl RefreshDriver for Vsync {
 
 // ── Буфер страниц ───────────────────────────────────────────────────────────
 
-/// То, что видит Servo: свой буфер в контексте окна. `connection()` не
-/// отдаём — без него Servo не поднимает WebGL (как и раньше).
+/// То, что видит Servo: свой буфер в контексте окна. Подключение и текстуры
+/// из поверхностей — от контекста окна: по ним Servo рисует WebGL в своём
+/// потоке и забирает кадр.
 pub struct GpuPageContext {
     root: Rc<WindowRenderingContext>,
     gl: Rc<dyn Gl>,
@@ -182,6 +183,18 @@ impl RenderingContext for GpuPageContext {
 
     fn refresh_driver(&self) -> Option<Rc<dyn RefreshDriver>> {
         Some(self.refresh.clone())
+    }
+
+    fn connection(&self) -> Option<Connection> {
+        self.root.connection()
+    }
+
+    fn create_texture(&self, surface: Surface) -> Option<(SurfaceTexture, u32, euclid::default::Size2D<i32>)> {
+        self.root.create_texture(surface)
+    }
+
+    fn destroy_texture(&self, texture: SurfaceTexture) -> Option<Surface> {
+        self.root.destroy_texture(texture)
     }
 }
 

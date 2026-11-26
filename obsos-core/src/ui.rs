@@ -244,6 +244,7 @@ fn overlays(ctx: &egui::Context, shell: &mut Shell, page: Rect, p: &Palette, act
             painter.galley(r.min + vec2(6.0, 3.0), galley, p.text);
         }
     }
+    permission_bars(ctx, shell, page, p);
     if shell.infobars.is_empty() {
         return;
     }
@@ -305,6 +306,31 @@ fn overlays(ctx: &egui::Context, shell: &mut Shell, page: Rect, p: &Palette, act
             }
         }
     });
+}
+
+/// Вопросы активной вкладки о микрофоне и камере.
+fn permission_bars(ctx: &egui::Context, shell: &mut Shell, page: Rect, p: &Palette) {
+    let Some(active) = shell.active_view().map(|w| w.id()) else { return };
+    let Some(index) = shell.permissions.iter().position(|q| q.webview == active) else { return };
+    let (host, what) = (shell.permissions[index].host.clone(), shell.permissions[index].what);
+    let mut answer = None;
+    egui::Area::new(egui::Id::new("obsos-permission")).order(egui::Order::Foreground).fixed_pos(page.min + vec2(8.0, 6.0)).show(ctx, |ui| {
+        egui::Frame::new().fill(p.toolbar).corner_radius(4).inner_margin(Margin::symmetric(12, 8)).stroke(Stroke::new(1.0_f32, p.accent)).show(ui, |ui| {
+            ui.set_max_width((page.width() - 40.0).max(200.0));
+            ui.horizontal_wrapped(|ui| {
+                ui.label(format!("Сайт {host} просит доступ к {what}."));
+                if ui.button("Разрешить").clicked() {
+                    answer = Some(true);
+                }
+                if ui.button("Запретить").clicked() {
+                    answer = Some(false);
+                }
+            });
+        });
+    });
+    if let Some(allow) = answer {
+        shell.answer_permission(index, allow);
+    }
 }
 
 fn toasts(ctx: &egui::Context, shell: &mut Shell, page: Rect, p: &Palette) {

@@ -155,6 +155,8 @@ impl Shell {
         if let Some(at) = self.windows.parked.iter().position(|w| w.key == key) {
             let state = self.windows.parked.swap_remove(at);
             for tab in state.tabs {
+                let closed = tab.webview.id();
+                self.permissions.retain(|p| p.webview != closed);
                 if let Some(url) = tab.real_url {
                     self.closed.push(url.to_string());
                 }

@@ -9,6 +9,7 @@ publish = false
 [dependencies]
 servo.workspace = true
 servo-paint.workspace = true
+stylo_static_prefs.workspace = true
 euclid.workspace = true
 ipc-channel.workspace = true
 swgl.workspace = true

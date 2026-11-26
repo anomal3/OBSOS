@@ -121,6 +121,10 @@ impl Platform for Desktop {
         dialog(move || rfd::FileDialog::new().set_title(title).set_directory(dir).pick_folder())
     }
 
+    fn webrtc_available(&self) -> bool {
+        cfg!(feature = "video")
+    }
+
     fn notice_path(&self) -> String {
         // Рядом с программой (раздача), иначе — из исходников.
         let near = std::env::current_exe().ok().and_then(|e| Some(e.parent()?.join("NOTICE.md")));

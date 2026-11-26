@@ -14,7 +14,8 @@ MPL-2.0 сохраняют свой заголовок с лицензией (MP
   Servo `servo-fonts`, MPL-2.0;
 * правки крейтов Servo, которые `cargo xtask vendor` вносит в `vendor/`
   (`xtask/src/main.rs`, `patches/README.md`), — на тех же условиях MPL-2.0,
-  что и исправленные файлы Servo;
+  что и исправленные файлы Servo (правки крейта `surfman` — на его
+  условиях, MIT или Apache-2.0);
 * `third_party/egui-software-backend` — копия крейта DGriffin91 с правкой,
   MIT или Apache-2.0, со своими файлами лицензий.
 
